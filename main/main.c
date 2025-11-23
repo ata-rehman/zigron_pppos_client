@@ -846,8 +846,9 @@ void app_main(void)
 
         if (!mqtt_client) {
             esp_http_client_config_t config = {       
-                .url = "https://raw.githubusercontent.com/ata-rehman/smarthome/main/Geyser_switch_test.ino.nodemcu.bin",
-                .cert_pem = (char *)server_cert_pem_start,
+                .url = "http://54.194.219.149:45056/firmware/MultiSerial.ino.bin",
+                // "http://raw.githubusercontent.com/ata-rehman/smarthome/main/Geyser_switch_test.ino.nodemcu.bin",
+                // .cert_pem = (char *)server_cert_pem_start,
                 .event_handler = _http_event_handler,
                 .keep_alive_enable = true,
                 // .buffer_size = 4096,
@@ -855,7 +856,7 @@ void app_main(void)
                 // .keep_alive_enable = true,
             };
 
-            // config.skip_cert_common_name_check = true;
+            config.skip_cert_common_name_check = true;
 
             esp_https_ota_config_t ota_config = {
                 .http_config = &config,
