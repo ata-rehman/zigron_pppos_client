@@ -102,15 +102,6 @@ uint8_t get_humidity(void)
   return 90;
 }
 
-// Private Function Prototypes
-// Removed unused function
-// static void wifi_application_connected_events( void )
-// {
-//   ESP_LOGI(TAG, "WiFi Application Connected!");
-//   sntp_time_sync_task_start();
-// }
-
-
 static void periodic_timer_callback(void* arg)
 {
     loop_counter++;
@@ -353,37 +344,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     }
 }
 
-// Removed unused function
-// static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
-//     switch (evt->event_id) {
-//         case HTTP_EVENT_ERROR:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
-//             break;
-//         case HTTP_EVENT_ON_CONNECTED:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
-//             break;
-//         case HTTP_EVENT_HEADER_SENT:
-//             ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
-//             break;
-//         case HTTP_EVENT_ON_HEADER:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-//             break;
-//         case HTTP_EVENT_ON_DATA:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-//             break;
-//         case HTTP_EVENT_ON_FINISH:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
-//             break;
-//         case HTTP_EVENT_DISCONNECTED:
-//             ESP_LOGD(TAG, "HTTP_EVENT_DISCONNECTED");
-//             break;
-//         case HTTP_EVENT_REDIRECT:
-//             ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
-//             break;
-//     }
-//     return ESP_OK;
-// }
-
 static void on_ppp_changed(void *arg, esp_event_base_t event_base,
                            int32_t event_id, void *event_data)
 {
@@ -429,132 +389,6 @@ static void on_ip_event(void *arg, esp_event_base_t event_base,
         ESP_LOGI(TAG, "Got IPv6 address " IPV6STR, IPV62STR(event->ip6_info.ip));
     }
 }
-
-// static esp_err_t http_event_handler(esp_http_client_event_t *evt) {
-//     switch (evt->event_id) {
-//         case HTTP_EVENT_ERROR:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ERROR");
-//             break;
-//         case HTTP_EVENT_ON_CONNECTED:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ON_CONNECTED");
-//             break;
-//         case HTTP_EVENT_HEADER_SENT:
-//             ESP_LOGD(TAG, "HTTP_EVENT_HEADER_SENT");
-//             break;
-//         case HTTP_EVENT_ON_HEADER:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ON_HEADER, key=%s, value=%s", evt->header_key, evt->header_value);
-//             break;
-//         case HTTP_EVENT_ON_DATA:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ON_DATA, len=%d", evt->data_len);
-//             break;
-//         case HTTP_EVENT_ON_FINISH:
-//             ESP_LOGD(TAG, "HTTP_EVENT_ON_FINISH");
-//             break;
-//         case HTTP_EVENT_DISCONNECTED:
-//             ESP_LOGD(TAG, "HTTP_EVENT_DISCONNECTED");
-//             break;
-//         case HTTP_EVENT_REDIRECT:
-//             ESP_LOGD(TAG, "HTTP_EVENT_REDIRECT");
-//             break;
-//     }
-//     return ESP_OK;
-// }
-
-// // Add near other helper functions (above app_main)
-// static esp_err_t perform_http_ota_http(const char *url)
-// {
-//     esp_err_t err = ESP_OK;
-//     esp_http_client_config_t config = {
-//         .url = url,
-//         .timeout_ms = 20000,
-//         .event_handler = http_event_handler,
-//         .transport_type = HTTP_TRANSPORT_OVER_TCP,
-//         .buffer_size = 4096,
-//     };
-
-//     ESP_LOGI(TAG, "Starting HTTP OTA from: %s", url);
-//     esp_http_client_handle_t client = esp_http_client_init(&config);
-//     if (!client) {
-//         ESP_LOGE(TAG, "Failed to initialise HTTP client");
-//         return ESP_FAIL;
-//     }
-
-//     err = esp_http_client_open(client, 0);
-//     if (err != ESP_OK) {
-//         ESP_LOGE(TAG, "Failed to open HTTP connection: %s", esp_err_to_name(err));
-//         esp_http_client_cleanup(client);
-//         return err;
-//     }
-
-//     const esp_partition_t *update_partition = esp_ota_get_next_update_partition(NULL);
-//     if (update_partition == NULL) {
-//         ESP_LOGE(TAG, "esp_ota_get_next_update_partition returned NULL");
-//         esp_http_client_cleanup(client);
-//         return ESP_FAIL;
-//     }
-//     ESP_LOGI(TAG, "Writing to partition subtype %d, address 0x%08x",
-//              update_partition->subtype, update_partition->address);
-
-//     esp_ota_handle_t ota_handle = 0;
-//     err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &ota_handle);
-//     if (err != ESP_OK) {
-//         ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(err));
-//         esp_http_client_cleanup(client);
-//         return err;
-//     }
-
-//     // Read loop
-//     const int buf_size = 4096;
-//     uint8_t *ota_buffer = (uint8_t *)malloc(buf_size);
-//     if (!ota_buffer) {
-//         ESP_LOGE(TAG, "No memory for OTA buffer");
-//         esp_ota_end(ota_handle);
-//         esp_http_client_cleanup(client);
-//         return ESP_ERR_NO_MEM;
-//     }
-
-//     int data_read;
-//     int total = 0;
-//     while ((data_read = esp_http_client_read(client, (char *)ota_buffer, buf_size)) > 0) {
-//         err = esp_ota_write(ota_handle, (const void *)ota_buffer, data_read);
-//         if (err != ESP_OK) {
-//             ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(err));
-//             free(ota_buffer);
-//             esp_ota_end(ota_handle);
-//             esp_http_client_cleanup(client);
-//             return err;
-//         }
-//         total += data_read;
-//         ESP_LOGD(TAG, "Wrote %d bytes (total %d)", data_read, total);
-//     }
-
-//     free(ota_buffer);
-
-//     if (data_read < 0) {
-//         ESP_LOGE(TAG, "Error: esp_http_client_read failed: %d", data_read);
-//         esp_ota_end(ota_handle);
-//         esp_http_client_cleanup(client);
-//         return ESP_FAIL;
-//     }
-
-//     err = esp_ota_end(ota_handle);
-//     if (err != ESP_OK) {
-//         ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(err));
-//         esp_http_client_cleanup(client);
-//         return err;
-//     }
-
-//     err = esp_ota_set_boot_partition(update_partition);
-//     if (err != ESP_OK) {
-//         ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));
-//         esp_http_client_cleanup(client);
-//         return err;
-//     }
-
-//     ESP_LOGI(TAG, "OTA successful, total bytes written: %d. Boot partition set.", total);
-//     esp_http_client_cleanup(client);
-//     return ESP_OK;
-// }
 
 extern const uint8_t server_cert_pem_start[] asm("_binary_ca_cert_pem_start");
 extern const uint8_t server_cert_pem_end[] asm("_binary_ca_cert_pem_end");
@@ -845,9 +679,10 @@ void app_main(void)
         */
 
         if (!mqtt_client) {
-            esp_http_client_config_t config = {       
-                .url = "http://54.194.219.149:45056/firmware/MultiSerial.ino.bin",
-                // "http://raw.githubusercontent.com/ata-rehman/smarthome/main/Geyser_switch_test.ino.nodemcu.bin",
+            esp_http_client_config_t config = {    
+                .url = "http://54.194.219.149:45056/firmware/zigron_demo.bin",
+                // "http://54.194.219.149:45056/firmware/MultiSerial.ino.bin",
+                // .url = "http://raw.githubusercontent.com/ata-rehman/smarthome/main/MultiSerial.ino.bin",
                 // .cert_pem = (char *)server_cert_pem_start,
                 .event_handler = _http_event_handler,
                 .keep_alive_enable = true,
@@ -856,7 +691,10 @@ void app_main(void)
                 // .keep_alive_enable = true,
             };
 
-            config.skip_cert_common_name_check = true;
+            // config.skip_cert_common_name_check = true;
+            // config.cert_pem = NULL;
+
+            // config.skip_cert_common_name_check = true;
 
             esp_https_ota_config_t ota_config = {
                 .http_config = &config,
