@@ -6,6 +6,8 @@
 /* PPPoS Client Example + Zigron custom logic (refactored with tasks + MQTT-triggered OTA)
 */
 
+#include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <inttypes.h>
 #include <ctype.h>
@@ -23,24 +25,24 @@
 #include "sdkconfig.h"
 #include "esp_task_wdt.h"
 #include "driver/gpio.h"
-
+#include "nvs_flash.h"
 #include "esp_mac.h"
 #include "mcp3002.h"
 #include "esp_timer.h"
-
-#include "nvs_flash.h"
-#include "wifi_app.h"
-#include "sntp_time_sync.h"
-
+#include "esp_event.h"
+#include "esp_system.h"
+#include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
+// WiFi headers for ESP-IDF v5.5.1
+#include "esp_wifi.h"
 
 #define PACKET_TIMEOUT      30          // 30 seconds
 #define FW_VER              "0.03"
 #define EXAMPLE_FLOW_CONTROL ESP_MODEM_FLOW_CONTROL_NONE
 
-static const char *TAG = "pppos_example";
+static const char *TAG = "Zigron_Wifi_GSM";
 
 /* Event group for PPP + app status */
 static EventGroupHandle_t event_group = NULL;
@@ -683,7 +685,6 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
-    ESP_ERROR_CHECK(ret);
 
     mcpInit(&dev, MCP3008, CONFIG_MISO_GPIO, CONFIG_MOSI_GPIO,
             CONFIG_SCLK_GPIO, CONFIG_CS_GPIO, MCP_SINGLE);
