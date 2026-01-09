@@ -179,6 +179,7 @@ static bool connect_wifi(void)
     
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "WiFi connected successfully");
+        wifi_retry_count = 0;  // Reset retry count on successful connection
         return true;
     } else {
         ESP_LOGW(TAG, "WiFi connection timeout");
@@ -205,10 +206,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                 ESP_LOGW(TAG, "WiFi station disconnected");
                 xEventGroupClearBits(event_group, WIFI_CONNECTED_BIT | MQTT_CONNECTED_BIT);
                 
-                if (xSemaphoreTake(conn_mutex, portMAX_DELAY) == pdTRUE) {
+                if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     if (current_conn_mode == CONN_MODE_WIFI) {
-                        current_conn_mode = CONN_MODE_NONE;
-                        ESP_LOGI(TAG, "Switching from WiFi to no connection");
+                        // Only log, don't change connection mode - let connectivity manager handle it
+                        ESP_LOGI(TAG, "WiFi disconnected, will attempt GSM fallback");
                     }
                     xSemaphoreGive(conn_mutex);
                 }
@@ -219,6 +220,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                     esp_wifi_connect();
                 } else {
                     ESP_LOGW(TAG, "Max WiFi retries reached, staying disconnected");
+                    // Don't call esp_wifi_connect() anymore, let GSM take over
                 }
                 break;
         }
@@ -234,7 +236,7 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
         
         wifi_retry_count = 0;  // Reset retry count on successful connection
         
-        if (xSemaphoreTake(conn_mutex, portMAX_DELAY) == pdTRUE) {
+        if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             current_conn_mode = CONN_MODE_WIFI;
             xSemaphoreGive(conn_mutex);
         }
@@ -378,7 +380,7 @@ static void check_ppp_connection(esp_modem_dce_t *dce, esp_mqtt_client_handle_t 
 
         bool gsm_connected = ((xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) == GSM_CONNECTED_BIT);
 
-        if (!gsm_connected && !recovery_in_progress) {
+        if (!gsm_connected && !recovery_in_progress && current_conn_mode == CONN_MODE_GSM) {
             ESP_LOGW(TAG, "GSM PPP connection lost, attempting recovery. (fail count: %d)", ppp_fail_count);
             ppp_fail_count++;
             recovery_in_progress = true;
@@ -459,7 +461,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         printf("DATA=%.*s\r\n", event->data_len, event->data);
 
         /* Clear alarm state on any data */
-        if (data_mutex && xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
+        if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             for (int i = 0; i < TOTAL_ZONE; i++) {
                 zone_alert_state[i] = 0;
             }
@@ -544,22 +546,19 @@ static void on_ip_event(void *arg, esp_event_base_t event_base,
         
         xEventGroupSetBits(event_group, GSM_CONNECTED_BIT);
         
-        if (xSemaphoreTake(conn_mutex, portMAX_DELAY) == pdTRUE) {
-            // Only switch to GSM if WiFi is not connected
-            if (current_conn_mode != CONN_MODE_WIFI) {
-                current_conn_mode = CONN_MODE_GSM;
-                ESP_LOGI(TAG, "Switched to GSM connection");
-            }
+        if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            current_conn_mode = CONN_MODE_GSM;
+            ESP_LOGI(TAG, "GSM PPP connection active");
             xSemaphoreGive(conn_mutex);
         }
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
         ESP_LOGI(TAG, "GSM Modem disconnected from PPP server");
         xEventGroupClearBits(event_group, GSM_CONNECTED_BIT);
         
-        if (xSemaphoreTake(conn_mutex, portMAX_DELAY) == pdTRUE) {
+        if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             if (current_conn_mode == CONN_MODE_GSM) {
                 current_conn_mode = CONN_MODE_NONE;
-                ESP_LOGI(TAG, "Switching from GSM to no connection");
+                ESP_LOGI(TAG, "GSM PPP connection lost");
             }
             xSemaphoreGive(conn_mutex);
         }
@@ -641,12 +640,14 @@ static void ota_task(void *arg)
 }
 
 /* -------------------------------------------------------------------------- */
-/* Connectivity Manager Task                                                  */
+/* FIXED: Connectivity Manager Task                                           */
 /* -------------------------------------------------------------------------- */
 
 static void connectivity_manager_task(void *arg)
 {
     esp_modem_dce_t *dce = (esp_modem_dce_t *)arg;
+    static bool gsm_activated = false;
+    static uint32_t last_gsm_activation_attempt = 0;
     
     ESP_LOGI(TAG, "Connectivity Manager task started");
     
@@ -654,40 +655,96 @@ static void connectivity_manager_task(void *arg)
     ESP_LOGI(TAG, "Attempting WiFi connection first...");
     if (connect_wifi()) {
         ESP_LOGI(TAG, "WiFi connected successfully - using as primary");
+        current_conn_mode = CONN_MODE_WIFI;
     } else {
         ESP_LOGW(TAG, "WiFi connection failed, will use GSM as backup");
-        // GSM will be initialized and connected in main
+        // WiFi failed at startup - GSM will be activated in the main loop
     }
     
-    // Monitor connectivity and switch between WiFi/GSM
     while (1) {
-        bool wifi_connected = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) == WIFI_CONNECTED_BIT);
-        bool gsm_connected = ((xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) == GSM_CONNECTED_BIT);
+        bool wifi_connected = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0);
+        bool gsm_connected = ((xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) != 0);
+        uint32_t current_time = esp_timer_get_time() / 1000000;
         
         if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // WiFi has priority - if it connects, use it
-            if (wifi_connected && current_conn_mode != CONN_MODE_WIFI) {
-                current_conn_mode = CONN_MODE_WIFI;
-                ESP_LOGI(TAG, "Switched to WiFi connection (priority)");
-            }
-            // If WiFi disconnects and GSM is available, switch to GSM
-            else if (!wifi_connected && gsm_connected && current_conn_mode != CONN_MODE_GSM) {
-                current_conn_mode = CONN_MODE_GSM;
-                ESP_LOGI(TAG, "Switched to GSM connection (WiFi unavailable)");
-            }
-            // Try to reconnect WiFi periodically if it's down
-            else if (!wifi_connected && current_conn_mode != CONN_MODE_WIFI) {
-                static uint32_t last_wifi_attempt = 0;
-                uint32_t current_time = esp_timer_get_time() / 1000000;
-                
-                if (current_time - last_wifi_attempt > 300) { // Try every 5 minutes
-                    ESP_LOGI(TAG, "Attempting WiFi reconnection...");
-                    connect_wifi();
-                    last_wifi_attempt = current_time;
+            // CRITICAL FIX: If WiFi is not connected AND GSM is not connected AND GSM is not activated
+            if (!wifi_connected && !gsm_connected && !gsm_activated) {
+                // Check if enough time has passed since last attempt
+                if (current_time - last_gsm_activation_attempt > 60) { // Wait 60 seconds between attempts
+                    ESP_LOGI(TAG, "No network available - activating GSM PPP connection");
+                    
+                    // Switch GSM modem to data mode
+                    esp_err_t ret = esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA);
+                    if (ret == ESP_OK) {
+                        ESP_LOGI(TAG, "GSM data mode activated, waiting for PPP connection");
+                        gsm_activated = true;
+                        current_conn_mode = CONN_MODE_GSM;
+                        
+                        // Wait for PPP connection (up to 45 seconds)
+                        EventBits_t bits = xEventGroupWaitBits(event_group,
+                            GSM_CONNECTED_BIT | WIFI_CONNECTED_BIT,
+                            pdFALSE, pdFALSE,
+                            pdMS_TO_TICKS(45000));
+                        
+                        if (bits & GSM_CONNECTED_BIT) {
+                            ESP_LOGI(TAG, "GSM PPP connection established");
+                        } else if (bits & WIFI_CONNECTED_BIT) {
+                            ESP_LOGI(TAG, "WiFi reconnected while waiting for GSM");
+                            gsm_activated = false;
+                            esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+                        } else {
+                            ESP_LOGW(TAG, "GSM PPP connection timeout");
+                            gsm_activated = false;
+                            esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+                        }
+                    } else {
+                        ESP_LOGE(TAG, "Failed to activate GSM data mode: %s", esp_err_to_name(ret));
+                    }
+                    last_gsm_activation_attempt = current_time;
                 }
+            }
+            // If WiFi connects and we're on GSM, switch back
+            else if (wifi_connected && current_conn_mode == CONN_MODE_GSM) {
+                ESP_LOGI(TAG, "WiFi reconnected, switching from GSM to WiFi");
+                current_conn_mode = CONN_MODE_WIFI;
+                
+                // Switch GSM back to command mode to save power
+                if (gsm_activated) {
+                    esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+                    gsm_activated = false;
+                }
+            }
+            // If GSM connects, update connection mode
+            else if (gsm_connected && current_conn_mode != CONN_MODE_GSM) {
+                current_conn_mode = CONN_MODE_GSM;
+                ESP_LOGI(TAG, "GSM connection active");
             }
             
             xSemaphoreGive(conn_mutex);
+        }
+        
+        // Periodically try to reconnect WiFi (if GSM is active)
+        if (current_conn_mode == CONN_MODE_GSM) {
+            static uint32_t last_wifi_attempt = 0;
+            
+            if (current_time - last_wifi_attempt > 300) { // Try every 5 minutes
+                ESP_LOGI(TAG, "Attempting WiFi reconnection while on GSM...");
+                
+                esp_wifi_start();
+                esp_wifi_connect();
+                
+                EventBits_t bits = xEventGroupWaitBits(event_group, 
+                    WIFI_CONNECTED_BIT,
+                    pdFALSE, pdFALSE, 
+                    pdMS_TO_TICKS(30000));
+                
+                if (!(bits & WIFI_CONNECTED_BIT)) {
+                    esp_wifi_disconnect();
+                    esp_wifi_stop();
+                }
+                
+                last_wifi_attempt = current_time;
+            }
         }
         
         vTaskDelay(pdMS_TO_TICKS(10000)); // Check every 10 seconds
@@ -714,10 +771,37 @@ static void mqtt_task(void *arg)
     bool mqtt_started           = false;
     uint32_t last_mqtt_publish  = 0;
     uint32_t last_connection_check = 0;
+    uint32_t network_unavailable_start = 0;
+    bool emergency_gsm_triggered = false;
 
     while (1) {
         bool network_connected = ((xEventGroupGetBits(event_group) & 
                                  (WIFI_CONNECTED_BIT | GSM_CONNECTED_BIT)) != 0);
+        
+        // Emergency GSM activation if no network for too long
+        if (!network_connected) {
+            if (network_unavailable_start == 0) {
+                network_unavailable_start = esp_timer_get_time() / 1000000;
+                emergency_gsm_triggered = false;
+            }
+            
+            uint32_t unavailable_duration = (esp_timer_get_time() / 1000000) - network_unavailable_start;
+            
+            // If no network for 2 minutes, trigger emergency GSM activation
+            if (unavailable_duration > 120 && !emergency_gsm_triggered) {
+                ESP_LOGW(TAG, "No network for %d seconds - emergency GSM activation", unavailable_duration);
+                
+                // Signal connectivity manager to activate GSM
+                if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    current_conn_mode = CONN_MODE_NONE; // Reset to trigger GSM activation
+                    xSemaphoreGive(conn_mutex);
+                }
+                emergency_gsm_triggered = true;
+            }
+        } else {
+            network_unavailable_start = 0;
+            emergency_gsm_triggered = false;
+        }
         
         if (!network_connected) {
             if (mqtt_client && mqtt_started) {
@@ -820,7 +904,7 @@ static void mqtt_task(void *arg)
                     ESP_LOGI(TAG, "Published via %s: %s -> %s", 
                             (current_conn_mode == CONN_MODE_WIFI) ? "WiFi" : "GSM",
                             topic_buff, data_buff);
-                    // last_mqtt_publish = current_time;
+                    last_mqtt_publish = esp_timer_get_time() / 1000000;
                     prev_alert_flg    = local_alert_flg;
                 }
             }
@@ -904,7 +988,7 @@ void app_main(void)
                        DISCONNECT_BIT | OTA_TRIGGER_BIT | WIFI_CONNECTED_BIT | 
                        GSM_CONNECTED_BIT | MQTT_CONNECTED_BIT);
 
-    // Test GSM modem communication (but don't connect yet - WiFi has priority)
+    // Test GSM modem communication
     ESP_LOGI(TAG, "Testing basic GSM modem communication...");
     int retry_count = 0;
     bool gsm_available = false;
@@ -926,7 +1010,7 @@ void app_main(void)
         gsm_available = false;
     }
 
-    // Start GSM in command mode (ready for use if WiFi fails)
+    // Set GSM modem to command mode (ready for fallback activation)
     if (gsm_available) {
         ret = esp_modem_set_mode(dce, ESP_MODEM_MODE_DETECT);
         if (ret == ESP_OK) {
@@ -935,7 +1019,7 @@ void app_main(void)
             if (mode == ESP_MODEM_MODE_DATA) {
                 ret = esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
                 if (ret == ESP_OK) {
-                    ESP_LOGI(TAG, "GSM command mode restored (ready for backup)");
+                    ESP_LOGI(TAG, "GSM command mode restored (ready for fallback)");
                 }
             }
         }
@@ -952,6 +1036,26 @@ void app_main(void)
             }
         }
 #endif
+
+        // Quick test of GSM PPP capability
+        ESP_LOGI(TAG, "Testing GSM PPP capability...");
+        ret = esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA);
+        if (ret == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(5000)); // Wait a bit
+            EventBits_t bits = xEventGroupWaitBits(event_group, 
+                GSM_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
+            
+            if (bits & GSM_CONNECTED_BIT) {
+                ESP_LOGI(TAG, "GSM PPP test successful");
+                // Go back to command mode for now
+                esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+            } else {
+                ESP_LOGW(TAG, "GSM PPP test timed out (will still try as fallback)");
+                esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+            }
+        } else {
+            ESP_LOGE(TAG, "GSM data mode test failed: %s", esp_err_to_name(ret));
+        }
     }
 
     /* Start tasks */
