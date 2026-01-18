@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: Unlicense OR CC0-1.0
  */
-/* WiFi-first MQTT + OTA with GSM/PPP as backup
+/* WiFi-first MQTT + OTA with GSM/PPP as backup + Web Server + Permanent Hotspot
 */
 
 #include <stdio.h>
@@ -45,18 +45,22 @@
 #define WIFI_CONNECT_TIMEOUT_MS 30000   // 30 seconds WiFi timeout
 #define MAX_WIFI_RETRIES   3
 
+// Webserver and Hotspot constants
+#define AP_SSID "Zigron-Config"
+#define AP_PASSWORD "config1234"
+#define AP_CHANNEL 1
+#define AP_MAX_CONN 4
+#define NVS_CONFIG_NAMESPACE "zigron_config"
+#define TOTAL_ZONE 10
+
 static const char *TAG = "Zigron_Dual_MQTT";
 
 /* Event group for connectivity status */
 static EventGroupHandle_t event_group = NULL;
-static const int CONNECT_BIT          = BIT0;
-static const int DISCONNECT_BIT       = BIT1;
-static const int GOT_DATA_BIT         = BIT2;
-static const int USB_DISCONNECTED_BIT = BIT3;
-static const int OTA_TRIGGER_BIT      = BIT4;   // MQTT-triggered OTA
-static const int WIFI_CONNECTED_BIT   = BIT5;   // WiFi is connected
-static const int GSM_CONNECTED_BIT    = BIT6;   // GSM/PPP is connected
-static const int MQTT_CONNECTED_BIT   = BIT7;   // MQTT is connected
+static const int WIFI_CONNECTED_BIT   = BIT0;   // WiFi is connected
+static const int GSM_CONNECTED_BIT    = BIT1;   // GSM/PPP is connected
+static const int MQTT_CONNECTED_BIT   = BIT2;   // MQTT is connected
+static const int OTA_TRIGGER_BIT      = BIT3;   // MQTT-triggered OTA
 
 /* Connectivity mode */
 typedef enum {
@@ -76,7 +80,6 @@ char    mac_string[13] = "0123456789AB";
 char data_buff[255];
 char topic_buff[255];
 
-#define TOTAL_ZONE 10
 static uint8_t  zone_alert_state[TOTAL_ZONE];
 static uint16_t zone_raw_value[TOTAL_ZONE];
 
@@ -97,9 +100,38 @@ static int      wifi_retry_count = 0;
 static SemaphoreHandle_t data_mutex = NULL;
 static SemaphoreHandle_t conn_mutex = NULL;  // For connectivity mode changes
 
+/* Configuration structure */
+typedef struct {
+    char wifi_ssid[32];
+    char wifi_password[64];
+    char mqtt_broker_url[128];
+    uint16_t zone_lower[TOTAL_ZONE];
+    uint16_t zone_upper[TOTAL_ZONE];
+    uint32_t publish_interval_ms;
+    bool enable_ota;
+} device_config_t;
+
+// Default configuration
+static device_config_t g_config = {
+    .wifi_ssid = "",
+    .wifi_password = "",
+    .mqtt_broker_url = "mqtt://zigron:zigron123@54.194.219.149:45055",
+    .publish_interval_ms = 5000,
+    .enable_ota = true,
+};
+
+// HTTP Server
+static httpd_handle_t server = NULL;
+static bool ap_mode_active = true;
+
+// Task handles
+static TaskHandle_t wifi_task_handle = NULL;
+static TaskHandle_t webserver_task_handle = NULL;
+
 /* Forward declarations */
 static void init_wifi(void);
 static bool connect_wifi(void);
+static void start_hotspot(void);
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, 
                                int32_t event_id, void* event_data);
 static void ip_event_handler(void* arg, esp_event_base_t event_base,
@@ -113,51 +145,156 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data);
 static void on_ppp_changed(void *arg, esp_event_base_t event_base,
                            int32_t event_id, void *event_data);
+static void on_ip_event(void *arg, esp_event_base_t event_base,
+                        int32_t event_id, void *event_data);
 static esp_err_t _http_event_handler(esp_http_client_event_t *evt);
 
 static void sensor_task(void *arg);
 static void mqtt_task(void *arg);
 static void ota_task(void *arg);
 static void connectivity_manager_task(void *arg);
+static void webserver_task(void *arg);
+static void wifi_connection_task(void *arg);
 
-/* WiFi Configuration */
-static wifi_config_t wifi_config = {
-    .sta = {
-        .ssid = "11/2 homes A",
-        .password = "03345472486",
-        .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        .pmf_cfg = {
-            .capable = true,
-            .required = false
+/* NVS Configuration Functions */
+static esp_err_t save_config_to_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+    
+    err = nvs_open(NVS_CONFIG_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    
+    err = nvs_set_blob(handle, "config", &g_config, sizeof(g_config));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t load_config_from_nvs(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+    size_t required_size = 0;
+    
+    err = nvs_open(NVS_CONFIG_NAMESPACE, NVS_READONLY, &handle);
+    if (err != ESP_OK) return err;
+    
+    // Check if config exists
+    err = nvs_get_blob(handle, "config", NULL, &required_size);
+    if (err == ESP_OK && required_size == sizeof(g_config)) {
+        err = nvs_get_blob(handle, "config", &g_config, &required_size);
+        ESP_LOGI(TAG, "Loaded config from NVS");
+        ESP_LOGI(TAG, "WiFi SSID: %s", g_config.wifi_ssid);
+        ESP_LOGI(TAG, "MQTT Broker: %s", g_config.mqtt_broker_url);
+        
+        // Apply loaded thresholds
+        memcpy(zone_lower_limit, g_config.zone_lower, sizeof(g_config.zone_lower));
+        memcpy(zone_upper_limit, g_config.zone_upper, sizeof(g_config.zone_upper));
+        
+        // Check if MQTT broker is empty and set a default
+        if (strlen(g_config.mqtt_broker_url) == 0) {
+            ESP_LOGW(TAG, "MQTT broker URL is empty, setting default");
+            strcpy(g_config.mqtt_broker_url, "mqtt://zigron:zigron123@54.194.219.149:45055");
+        }
+    } else {
+        // If no config saved, use defaults
+        memcpy(g_config.zone_lower, zone_lower_limit, sizeof(zone_lower_limit));
+        memcpy(g_config.zone_upper, zone_upper_limit, sizeof(zone_upper_limit));
+        ESP_LOGW(TAG, "No saved config in NVS, using defaults");
+        ESP_LOGI(TAG, "Default WiFi SSID: %s", g_config.wifi_ssid);
+        ESP_LOGI(TAG, "Default MQTT Broker: %s", g_config.mqtt_broker_url);
+        err = ESP_ERR_NOT_FOUND;
+    }
+    
+    nvs_close(handle);
+    return err;
+}
+
+/* Hotspot Functions */
+static void start_hotspot(void)
+{
+    ESP_LOGI(TAG, "Starting hotspot (AP mode)...");
+    
+    // Configure AP settings
+    wifi_config_t wifi_config_ap = {
+        .ap = {
+            .ssid = AP_SSID,
+            .ssid_len = strlen(AP_SSID),
+            .channel = AP_CHANNEL,
+            .password = AP_PASSWORD,
+            .max_connection = AP_MAX_CONN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .required = true,
+            },
         },
-    },
-};
+    };
+    
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config_ap));
+    
+    // Get and log AP IP address
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif) {
+        esp_netif_ip_info_t ip_info;
+        esp_netif_get_ip_info(ap_netif, &ip_info);
+        ESP_LOGI(TAG, "Hotspot started:");
+        ESP_LOGI(TAG, "  SSID: %s", AP_SSID);
+        ESP_LOGI(TAG, "  Password: %s", AP_PASSWORD);
+        ESP_LOGI(TAG, "  IP Address: " IPSTR, IP2STR(&ip_info.ip));
+        ESP_LOGI(TAG, "Connect to hotspot and visit: http://" IPSTR, IP2STR(&ip_info.ip));
+    }
+    
+    ap_mode_active = true;
+}
 
-/* -------------------------------------------------------------------------- */
-/* WiFi Functions                                                             */
-/* -------------------------------------------------------------------------- */
-
+/* WiFi Functions */
 static void init_wifi(void)
 {
     ESP_LOGI(TAG, "Initializing WiFi...");
     
     esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
     
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     
+    // Set WiFi to AP+STA mode (simultaneous)
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    
     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &ip_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &ip_event_handler, NULL));
     
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    
-    ESP_LOGI(TAG, "WiFi initialization complete");
+    ESP_LOGI(TAG, "WiFi initialization complete in AP+STA mode");
 }
 
 static bool connect_wifi(void)
 {
-    ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", wifi_config.sta.ssid);
+    ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", g_config.wifi_ssid);
+    
+    if (strlen(g_config.wifi_ssid) == 0) {
+        ESP_LOGW(TAG, "WiFi SSID not configured");
+        return false;
+    }
+    
+    // Configure WiFi station
+    wifi_config_t wifi_config_sta = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+    
+    strncpy((char*)wifi_config_sta.sta.ssid, g_config.wifi_ssid, sizeof(wifi_config_sta.sta.ssid));
+    strncpy((char*)wifi_config_sta.sta.password, g_config.wifi_password, sizeof(wifi_config_sta.sta.password));
+    
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config_sta));
     
     esp_err_t ret = esp_wifi_start();
     if (ret != ESP_OK) {
@@ -179,12 +316,10 @@ static bool connect_wifi(void)
     
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "WiFi connected successfully");
-        wifi_retry_count = 0;  // Reset retry count on successful connection
+        wifi_retry_count = 0;
         return true;
     } else {
         ESP_LOGW(TAG, "WiFi connection timeout");
-        esp_wifi_disconnect();
-        esp_wifi_stop();
         return false;
     }
 }
@@ -194,8 +329,17 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 {
     if (event_base == WIFI_EVENT) {
         switch (event_id) {
+            case WIFI_EVENT_AP_STACONNECTED:
+                ESP_LOGI(TAG, "Station connected to AP");
+                break;
+                
+            case WIFI_EVENT_AP_STADISCONNECTED:
+                ESP_LOGI(TAG, "Station disconnected from AP");
+                break;
+                
             case WIFI_EVENT_STA_START:
                 ESP_LOGI(TAG, "WiFi station started");
+                esp_wifi_connect();
                 break;
                 
             case WIFI_EVENT_STA_CONNECTED:
@@ -208,7 +352,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                 
                 if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     if (current_conn_mode == CONN_MODE_WIFI) {
-                        // Only log, don't change connection mode - let connectivity manager handle it
                         ESP_LOGI(TAG, "WiFi disconnected, will attempt GSM fallback");
                     }
                     xSemaphoreGive(conn_mutex);
@@ -220,7 +363,6 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                     esp_wifi_connect();
                 } else {
                     ESP_LOGW(TAG, "Max WiFi retries reached, staying disconnected");
-                    // Don't call esp_wifi_connect() anymore, let GSM take over
                 }
                 break;
         }
@@ -230,24 +372,85 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 static void ip_event_handler(void* arg, esp_event_base_t event_base,
                             int32_t event_id, void* event_data)
 {
-    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        
-        wifi_retry_count = 0;  // Reset retry count on successful connection
-        
-        if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            current_conn_mode = CONN_MODE_WIFI;
-            xSemaphoreGive(conn_mutex);
+    if (event_base == IP_EVENT) {
+        if (event_id == IP_EVENT_STA_GOT_IP) {
+            ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+            ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+            
+            wifi_retry_count = 0;
+            
+            if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                current_conn_mode = CONN_MODE_WIFI;
+                xSemaphoreGive(conn_mutex);
+            }
+            
+            xEventGroupSetBits(event_group, WIFI_CONNECTED_BIT);
+            
+        } else if (event_id == IP_EVENT_AP_STAIPASSIGNED) {
+            ip_event_ap_staipassigned_t* event = (ip_event_ap_staipassigned_t*) event_data;
+            ESP_LOGI(TAG, "AP assigned IP to station: " IPSTR, IP2STR(&event->ip));
         }
-        
-        xEventGroupSetBits(event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* Sensor task (unchanged)                                                    */
-/* -------------------------------------------------------------------------- */
+/* WiFi Connection Task - MODIFIED to keep hotspot always active */
+static void wifi_connection_task(void *arg)
+{
+    ESP_LOGI(TAG, "WiFi connection task started");
+    
+    // Always start hotspot first
+    start_hotspot();
+    
+    // Main WiFi connection loop
+    while (1) {
+        // Check if WiFi credentials are configured
+        if (strlen(g_config.wifi_ssid) == 0) {
+            ESP_LOGW(TAG, "WiFi SSID not configured. Hotspot is active for configuration.");
+            
+            // Wait for 30 seconds before checking again
+            for (int i = 0; i < 30; i++) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                if (strlen(g_config.wifi_ssid) > 0) {
+                    break;  // SSID configured, break out of wait loop
+                }
+            }
+            continue;
+        }
+        
+        ESP_LOGI(TAG, "Attempting to connect to WiFi: %s", g_config.wifi_ssid);
+        
+        // Try to connect to WiFi (hotspot remains active)
+        if (connect_wifi()) {
+            ESP_LOGI(TAG, "Successfully connected to WiFi: %s", g_config.wifi_ssid);
+            ESP_LOGI(TAG, "Hotspot remains active at SSID: %s", AP_SSID);
+            
+            // Monitor connection while connected
+            while ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) {
+                vTaskDelay(pdMS_TO_TICKS(10000));  // Check every 10 seconds
+                
+                // Check connection status
+                wifi_ap_record_t ap_info;
+                if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) {
+                    ESP_LOGW(TAG, "WiFi connection lost");
+                    xEventGroupClearBits(event_group, WIFI_CONNECTED_BIT | MQTT_CONNECTED_BIT);
+                    
+                    // Break to outer loop to retry connection
+                    break;
+                }
+            }
+            
+        } else {
+            ESP_LOGW(TAG, "Failed to connect to WiFi: %s", g_config.wifi_ssid);
+            ESP_LOGI(TAG, "Hotspot remains active for configuration");
+            
+            ESP_LOGI(TAG, "Will retry WiFi connection in 1 minute...");
+            vTaskDelay(pdMS_TO_TICKS(60 * 1000));  // Wait 1 minute before retrying
+        }
+        
+        // Reset retry count for next attempt
+        wifi_retry_count = 0;
+    }
+}
 
 static void sensor_task(void *arg)
 {
@@ -263,6 +466,7 @@ static void sensor_task(void *arg)
                 zone_alert_state[TOTAL_ZONE-2] = 0x01;
             } else {
                 alert_flg &= ~0x0100;
+                zone_alert_state[TOTAL_ZONE-2] = 0x00;  // Clear if no longer different
             }
 
             /* Digital inputs */
@@ -274,13 +478,19 @@ static void sensor_task(void *arg)
                 zone_raw_value[i] = mcpReadData(&dev, i);
 
                 uint16_t bitmask = 1 << i;
+                
+                // First, clear any existing alert state for this zone
+                zone_alert_state[i] = 0x00;
+                
+                // Then check if we need to set an alert
                 if (zone_raw_value[i] < zone_lower_limit[i]) {
-                    zone_alert_state[i] |= 0x01;
+                    zone_alert_state[i] = 0x01;  // Low alert
                     alert_flg |= bitmask;
                 } else if (zone_raw_value[i] > zone_upper_limit[i]) {
-                    zone_alert_state[i] |= 0x02;
+                    zone_alert_state[i] = 0x02;  // High alert
                     alert_flg |= bitmask;
                 } else {
+                    // Value is within range, clear the alert flag
                     alert_flg &= ~bitmask;
                 }
             }
@@ -291,7 +501,7 @@ static void sensor_task(void *arg)
                 zone_raw_value[4], zone_raw_value[5], zone_raw_value[6], zone_raw_value[7],
                 zone_raw_value[8], zone_raw_value[9]);
 
-            ESP_LOGI(TAG, "Sensor data: %s", data_buff);
+            ESP_LOGI(TAG, "Sensor data: %s, Alert flags: 0x%03X", data_buff, alert_flg);
 
             xSemaphoreGive(data_mutex);
         }
@@ -300,10 +510,7 @@ static void sensor_task(void *arg)
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* PPP/GSM helpers (modified for dual connectivity)                           */
-/* -------------------------------------------------------------------------- */
-
+/* GSM/PPP Functions (unchanged from your original) */
 static bool check_network_registration(esp_modem_dce_t *dce)
 {
     int rssi, ber;
@@ -408,10 +615,7 @@ static void check_ppp_connection(esp_modem_dce_t *dce, esp_mqtt_client_handle_t 
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* MQTT event handler (updated for dual connectivity)                         */
-/* -------------------------------------------------------------------------- */
-
+/* MQTT Event Handler */
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
@@ -470,8 +674,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             xSemaphoreGive(data_mutex);
         }
 
-        xEventGroupSetBits(event_group, GOT_DATA_BIT);
-
         /* OTA trigger: /ZIGRON/<MAC>/COMMAND topic with payload "OTA" */
         char cmd_topic[64];
         snprintf(cmd_topic, sizeof(cmd_topic), "/ZIGRON/%s/COMMAND", mac_string);
@@ -510,10 +712,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* IP / PPP event handlers (updated for dual connectivity)                    */
-/* -------------------------------------------------------------------------- */
-
+/* IP / PPP Event Handlers */
 static void on_ppp_changed(void *arg, esp_event_base_t event_base,
                            int32_t event_id, void *event_data)
 {
@@ -568,10 +767,7 @@ static void on_ip_event(void *arg, esp_event_base_t event_base,
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* HTTP client event handler (for OTA)                                        */
-/* -------------------------------------------------------------------------- */
-
+/* HTTP Client Event Handler (for OTA) */
 static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
 {
     switch (evt->event_id) {
@@ -588,10 +784,7 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-/* -------------------------------------------------------------------------- */
-/* OTA task – works with both WiFi and GSM                                    */
-/* -------------------------------------------------------------------------- */
-
+/* OTA Task */
 static void ota_task(void *arg)
 {
     ESP_LOGI(TAG, "OTA task started, waiting for OTA_TRIGGER_BIT from MQTT...");
@@ -639,10 +832,629 @@ static void ota_task(void *arg)
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* FIXED: Connectivity Manager Task                                           */
-/* -------------------------------------------------------------------------- */
+/* HTTP Server Handlers */
 
+// Helper function to parse form data
+static char* urldecode(char *dst, const char *src, size_t dstsize) {
+    char a, b;
+    size_t i = 0;
+    while (*src && i < dstsize - 1) {
+        if ((*src == '%') && ((a = src[1]) && (b = src[2])) && (isxdigit(a) && isxdigit(b))) {
+            if (a >= 'a') a -= 'a'-'A';
+            if (a >= 'A') a -= ('A' - 10);
+            else a -= '0';
+            if (b >= 'a') b -= 'a'-'A';
+            if (b >= 'A') b -= ('A' - 10);
+            else b -= '0';
+            dst[i++] = 16*a+b;
+            src+=3;
+        } else if (*src == '+') {
+            dst[i++] = ' ';
+            src++;
+        } else {
+            dst[i++] = *src++;
+        }
+    }
+    dst[i] = '\0';
+    return dst;
+}
+
+// Handler for status information
+static esp_err_t status_get_handler(httpd_req_t *req)
+{
+    char json[300];
+    
+    const char* device_mode = "AP+STA Mode";
+    const char* wifi_status = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
+    const char* wifi_class = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
+    const char* mqtt_status = ((xEventGroupGetBits(event_group) & MQTT_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
+    const char* mqtt_class = ((xEventGroupGetBits(event_group) & MQTT_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
+    
+    char ip_address[16] = "Not Available";
+    esp_netif_t* netif = NULL;
+    
+    // For web interface, show hotspot IP (AP interface)
+    netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (netif) {
+        esp_netif_ip_info_t ip_info;
+        esp_netif_get_ip_info(netif, &ip_info);
+        snprintf(ip_address, sizeof(ip_address), IPSTR, IP2STR(&ip_info.ip));
+    }
+    
+    snprintf(json, sizeof(json),
+        "{\"mode\":\"%s\",\"wifi\":\"%s\",\"mqtt\":\"%s\","
+        "\"ip\":\"%s\",\"wifi_class\":\"%s\",\"mqtt_class\":\"%s\"}",
+        device_mode, wifi_status, mqtt_status, ip_address, wifi_class, mqtt_class);
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    return ESP_OK;
+}
+
+// Handler for sensor data
+static esp_err_t sensor_data_get_handler(httpd_req_t *req)
+{
+    char json[800];
+    
+    if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        snprintf(json, sizeof(json),
+            "{\"RAW\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
+            "\"ALERT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
+            "\"LOW\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
+            "\"HIGH\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]}",
+            zone_raw_value[0], zone_raw_value[1], zone_raw_value[2], zone_raw_value[3],
+            zone_raw_value[4], zone_raw_value[5], zone_raw_value[6], zone_raw_value[7],
+            zone_raw_value[8], zone_raw_value[9],
+            zone_alert_state[0], zone_alert_state[1], zone_alert_state[2], zone_alert_state[3],
+            zone_alert_state[4], zone_alert_state[5], zone_alert_state[6], zone_alert_state[7],
+            zone_alert_state[8], zone_alert_state[9],
+            zone_lower_limit[0], zone_lower_limit[1], zone_lower_limit[2], zone_lower_limit[3],
+            zone_lower_limit[4], zone_lower_limit[5], zone_lower_limit[6], zone_lower_limit[7],
+            zone_lower_limit[8], zone_lower_limit[9],
+            zone_upper_limit[0], zone_upper_limit[1], zone_upper_limit[2], zone_upper_limit[3],
+            zone_upper_limit[4], zone_upper_limit[5], zone_upper_limit[6], zone_upper_limit[7],
+            zone_upper_limit[8], zone_upper_limit[9]);
+        
+        xSemaphoreGive(data_mutex);
+    } else {
+        strcpy(json, "{\"error\":\"Unable to read sensor data\"}");
+    }
+    
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_send(req, json, strlen(json));
+    return ESP_OK;
+}
+
+// Handler for Wi-Fi configuration
+static esp_err_t wifi_post_handler(httpd_req_t *req)
+{
+    char buf[256];
+    int ret;
+    
+    if ((ret = httpd_req_recv(req, buf, sizeof(buf)-1)) <= 0) {
+        if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+            httpd_resp_send_408(req);
+        }
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    // Parse form data
+    char ssid[32] = "";
+    char password[64] = "";
+    
+    char *token = strtok(buf, "&");
+    while (token != NULL) {
+        if (strncmp(token, "ssid=", 5) == 0) {
+            urldecode(ssid, token + 5, sizeof(ssid));
+        } else if (strncmp(token, "password=", 9) == 0) {
+            urldecode(password, token + 9, sizeof(password));
+        }
+        token = strtok(NULL, "&");
+    }
+    
+    // Save to configuration
+    if (strlen(ssid) > 0) {
+        strncpy(g_config.wifi_ssid, ssid, sizeof(g_config.wifi_ssid)-1);
+        g_config.wifi_ssid[sizeof(g_config.wifi_ssid)-1] = '\0';
+    }
+    if (strlen(password) > 0) {
+        strncpy(g_config.wifi_password, password, sizeof(g_config.wifi_password)-1);
+        g_config.wifi_password[sizeof(g_config.wifi_password)-1] = '\0';
+    }
+    
+    save_config_to_nvs();
+    
+    httpd_resp_send(req, "Wi-Fi settings saved. Device will attempt to connect to the new network...", -1);
+    
+    // Signal WiFi task to reconnect with new credentials
+    if (wifi_task_handle != NULL) {
+        xEventGroupClearBits(event_group, WIFI_CONNECTED_BIT);
+        
+        // Reconfigure STA with new credentials
+        wifi_config_t wifi_config_sta = {
+            .sta = {
+                .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+                .pmf_cfg = {
+                    .capable = true,
+                    .required = false
+                },
+            },
+        };
+        
+        strncpy((char*)wifi_config_sta.sta.ssid, g_config.wifi_ssid, sizeof(wifi_config_sta.sta.ssid));
+        strncpy((char*)wifi_config_sta.sta.password, g_config.wifi_password, sizeof(wifi_config_sta.sta.password));
+        
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config_sta));
+        
+        // Reconnect
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        esp_wifi_connect();
+    }
+    
+    return ESP_OK;
+}
+
+// Handler for MQTT configuration
+static esp_err_t mqtt_post_handler(httpd_req_t *req)
+{
+    char buf[256];
+    int ret;
+    
+    if ((ret = httpd_req_recv(req, buf, sizeof(buf)-1)) <= 0) {
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    // Parse form data
+    char broker[128] = "";
+    
+    if (strncmp(buf, "broker=", 7) == 0) {
+        urldecode(broker, buf + 7, sizeof(broker));
+    }
+    
+    // Save to configuration
+    if (strlen(broker) > 0) {
+        strncpy(g_config.mqtt_broker_url, broker, sizeof(g_config.mqtt_broker_url)-1);
+        g_config.mqtt_broker_url[sizeof(g_config.mqtt_broker_url)-1] = '\0';
+        save_config_to_nvs();
+        
+        httpd_resp_send(req, "MQTT settings saved.", -1);
+    } else {
+        httpd_resp_send(req, "Invalid broker URL", -1);
+    }
+    
+    return ESP_OK;
+}
+
+// Handler for threshold configuration
+static esp_err_t thresholds_post_handler(httpd_req_t *req)
+{
+    char buf[512];
+    int ret;
+    
+    if ((ret = httpd_req_recv(req, buf, sizeof(buf)-1)) <= 0) {
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    // Parse thresholds
+    for (int i = 0; i < TOTAL_ZONE; i++) {
+        char low_str[8] = "0";
+        char high_str[8] = "1023";
+        
+        // Find low value
+        char search[16];
+        snprintf(search, sizeof(search), "low%d=", i);
+        char *pos = strstr(buf, search);
+        if (pos) {
+            char *end = strchr(pos + strlen(search), '&');
+            if (end) {
+                strncpy(low_str, pos + strlen(search), end - (pos + strlen(search)));
+                low_str[end - (pos + strlen(search))] = '\0';
+            } else {
+                strcpy(low_str, pos + strlen(search));
+            }
+            urldecode(low_str, low_str, sizeof(low_str));
+        }
+        
+        // Find high value
+        snprintf(search, sizeof(search), "high%d=", i);
+        pos = strstr(buf, search);
+        if (pos) {
+            char *end = strchr(pos + strlen(search), '&');
+            if (end) {
+                strncpy(high_str, pos + strlen(search), end - (pos + strlen(search)));
+                high_str[end - (pos + strlen(search))] = '\0';
+            } else {
+                strcpy(high_str, pos + strlen(search));
+            }
+            urldecode(high_str, high_str, sizeof(high_str));
+        }
+        
+        // Update thresholds
+        g_config.zone_lower[i] = atoi(low_str);
+        g_config.zone_upper[i] = atoi(high_str);
+        
+        if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            zone_lower_limit[i] = g_config.zone_lower[i];
+            zone_upper_limit[i] = g_config.zone_upper[i];
+            xSemaphoreGive(data_mutex);
+        }
+    }
+    
+    save_config_to_nvs();
+    httpd_resp_send(req, "Thresholds saved successfully.", -1);
+    
+    return ESP_OK;
+}
+
+// Handler for interval configuration
+static esp_err_t interval_post_handler(httpd_req_t *req)
+{
+    char buf[64];
+    int ret;
+    
+    if ((ret = httpd_req_recv(req, buf, sizeof(buf)-1)) <= 0) {
+        return ESP_FAIL;
+    }
+    buf[ret] = '\0';
+    
+    // Parse interval
+    if (strncmp(buf, "interval=", 9) == 0) {
+        char interval_str[16];
+        urldecode(interval_str, buf + 9, sizeof(interval_str));
+        uint32_t interval = atoi(interval_str);
+        
+        if (interval >= 1000 && interval <= 30000) {
+            g_config.publish_interval_ms = interval;
+            save_config_to_nvs();
+            httpd_resp_send(req, "Publish interval updated.", -1);
+        } else {
+            httpd_resp_send(req, "Invalid interval (1000-30000 ms)", -1);
+        }
+    }
+    
+    return ESP_OK;
+}
+
+// Handler for command execution
+static esp_err_t command_get_handler(httpd_req_t *req)
+{
+    char cmd[64] = {0};
+    
+    // Get command parameter
+    size_t buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        char* buf = malloc(buf_len);
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            httpd_query_key_value(buf, "cmd", cmd, sizeof(cmd)-1);
+        }
+        free(buf);
+    }
+    
+    if (strlen(cmd) > 0) {
+        // Handle command
+        if (strcmp(cmd, "HOTSPOT") == 0) {
+            ESP_LOGI(TAG, "Hotspot refresh command received");
+            // Hotspot is always active, just log
+            httpd_resp_send(req, "Hotspot is always active", -1);
+        } else if (strcmp(cmd, "OTA") == 0) {
+            ESP_LOGI(TAG, "OTA command received via web interface");
+            xEventGroupSetBits(event_group, OTA_TRIGGER_BIT);
+            httpd_resp_send(req, "OTA update triggered", -1);
+        } else if (strcmp(cmd, "RESET") == 0) {
+            ESP_LOGI(TAG, "Reset command received, restarting...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            esp_restart();
+        } else if (strcmp(cmd, "CLEAR") == 0) {
+            ESP_LOGI(TAG, "Clear alerts command received");
+            if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                for (int i = 0; i < TOTAL_ZONE; i++) {
+                    zone_alert_state[i] = 0;
+                }
+                alert_flg = 0;
+                prev_alert_flg = 0;
+                xSemaphoreGive(data_mutex);
+            }
+            httpd_resp_send(req, "Alerts cleared", -1);
+        } else {
+            httpd_resp_send(req, "Unknown command", -1);
+        }
+    } else {
+        httpd_resp_send(req, "No command specified", -1);
+    }
+    
+    return ESP_OK;
+}
+
+// HTML for web interface
+static const char* config_html = 
+"<!DOCTYPE html>"
+"<html><head><title>Zigron Device</title>"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+"<style>"
+"body{font-family:Arial;margin:10px;background:#f5f5f5;}"
+".container{max-width:600px;margin:auto;background:white;padding:15px;border-radius:5px;}"
+"h1{color:#333;font-size:20px;}"
+"h2{color:#555;margin-top:20px;font-size:16px;}"
+".section{margin:15px 0;padding:10px;border-left:3px solid #4CAF50;background:#f9f9f9;}"
+"input{width:100%;padding:8px;margin:5px 0 10px;border:1px solid #ddd;border-radius:3px;box-sizing:border-box;}"
+"button{background:#4CAF50;color:white;padding:10px 15px;border:none;border-radius:3px;cursor:pointer;margin:5px;}"
+"button:hover{background:#45a049;}"
+".zone-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;margin-bottom:10px;}"
+".zone-item{padding:5px;border:1px solid #ddd;border-radius:3px;font-size:12px;}"
+".alert-low{background:#fff3cd;}"
+".alert-high{background:#f8d7da;}"
+".alert-normal{background:#d4edda;}"
+".form-section{margin-bottom:15px;}"
+".status-connected{color:green;}"
+".status-disconnected{color:red;}"
+"</style></head>"
+"<body>"
+"<div class='container'>"
+"<h1>Zigron Device (MAC: %s)</h1>"
+"<div class='section'>"
+"<h2>Device Status</h2>"
+"<div id='device-status'>"
+"<p>Device Mode: <span id='mode-status'>%s</span></p>"
+"<p>WiFi Status: <span id='wifi-status' class='%s'>%s</span></p>"
+"<p>MQTT Status: <span id='mqtt-status' class='%s'>%s</span></p>"
+"<p>Hotspot IP: <span id='ip-address'>%s</span></p>"
+"</div>"
+"</div>"
+"<div class='section'>"
+"<h2>Live Sensor Data</h2>"
+"<div id='sensor-data' class='zone-grid'>Loading...</div>"
+"</div>"
+"<div class='section'>"
+"<h2>Configuration</h2>"
+"<div class='form-section'>"
+"<h3>Wi-Fi Settings</h3>"
+"<form action='/save-wifi' method='post'>"
+"<input type='text' name='ssid' placeholder='WiFi SSID' value='%s'>"
+"<input type='password' name='password' placeholder='WiFi Password' value='%s'>"
+"<button type='submit'>Save WiFi Settings</button>"
+"</form>"
+"<p><small><i>Note: After saving WiFi settings, device will attempt to connect to the network. Hotspot remains active.</i></small></p>"
+"</div>"
+"<div class='form-section'>"
+"<h3>MQTT Settings</h3>"
+"<form action='/save-mqtt' method='post'>"
+"<input type='text' name='broker' placeholder='Broker URL (e.g., mqtt://broker.example.com)' value='%s'>"
+"<button type='submit'>Save MQTT</button>"
+"</form>"
+"</div>"
+"<div class='form-section'>"
+"<h3>Thresholds</h3>"
+"<form action='/save-thresholds' method='post'>"
+"<div id='threshold-inputs' class='zone-grid'>%s</div>"
+"<button type='submit'>Save All Thresholds</button>"
+"</form>"
+"</div>"
+"<div class='form-section'>"
+"<h3>Publish Interval (ms)</h3>"
+"<form action='/save-interval' method='post'>"
+"<input type='number' name='interval' value='%d' min='1000' max='30000'>"
+"<button type='submit'>Save Interval</button>"
+"</form>"
+"</div>"
+"</div>"
+"<div class='section'>"
+"<h2>Device Control</h2>"
+"<button onclick='sendCmd(\"OTA\")'>OTA Update</button>"
+"<button onclick='sendCmd(\"RESET\")'>Restart Device</button>"
+"<button onclick='sendCmd(\"CLEAR\")'>Clear Alerts</button>"
+"<button onclick='window.location.reload()'>Refresh Page</button>"
+"</div>"
+"<div class='section'>"
+"<h2>Hotspot Information</h2>"
+"<p><strong>Hotspot SSID:</strong> %s</p>"
+"<p><strong>Hotspot Password:</strong> %s</p>"
+"<p><strong>Hotspot IP:</strong> %s</p>"
+"<p><small><i>Hotspot is ALWAYS active. Connect to configure device anytime.</i></small></p>"
+"</div>"
+"</div>"
+"<script>"
+"function sendCmd(cmd){"
+"fetch('/command?cmd='+cmd).then(r=>alert('Command Sent: '+cmd));"
+"}"
+"function updateStatus(){"
+"fetch('/status').then(r=>r.json()).then(data=>{"
+"document.getElementById('mode-status').textContent = data.mode;"
+"document.getElementById('wifi-status').textContent = data.wifi;"
+"document.getElementById('mqtt-status').textContent = data.mqtt;"
+"document.getElementById('ip-address').textContent = data.ip;"
+"document.getElementById('wifi-status').className = data.wifi === 'Connected' ? 'status-connected' : 'status-disconnected';"
+"document.getElementById('mqtt-status').className = data.mqtt === 'Connected' ? 'status-connected' : 'status-disconnected';"
+"});"
+"}"
+"function updateSensorData(){"
+"fetch('/sensor-data').then(r=>r.json()).then(data=>{"
+"let html='';"
+"for(let i=0;i<data.RAW.length;i++){"
+"let cls='alert-normal';"
+"if(data.ALERT[i]==1)cls='alert-low';"
+"if(data.ALERT[i]==2)cls='alert-high';"
+"html+='<div class=\"zone-item '+cls+'\">Zone '+i+': '+data.RAW[i]+'</div>';"
+"}"
+"document.getElementById('sensor-data').innerHTML=html;"
+"});"
+"}"
+"setInterval(updateSensorData,2000);"
+"setInterval(updateStatus,5000);"
+"updateSensorData();"
+"updateStatus();"
+"</script>"
+"</body></html>";
+
+// Handler for root page
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "HTTP GET request received for root page");
+    
+    char zone_inputs[2000] = "";
+    
+    // Generate zone threshold inputs
+    for (int i = 0; i < TOTAL_ZONE; i++) {
+        char zone_html[300];
+        snprintf(zone_html, sizeof(zone_html),
+            "<div>"
+            "<small>Zone %d:</small><br>"
+            "<input type='number' name='low%d' value='%d' style='width:48%%;' placeholder='Low'>"
+            "<input type='number' name='high%d' value='%d' style='width:48%%;' placeholder='High'>"
+            "</div>",
+            i, i, g_config.zone_lower[i], i, g_config.zone_upper[i]);
+        strcat(zone_inputs, zone_html);
+    }
+    
+    // Determine status strings
+    const char* device_mode = "AP+STA Mode";
+    const char* wifi_status = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
+    const char* wifi_class = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
+    const char* mqtt_status = ((xEventGroupGetBits(event_group) & MQTT_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
+    const char* mqtt_class = ((xEventGroupGetBits(event_group) & MQTT_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
+    
+    char ip_address[16] = "Not Available";
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    
+    if (netif) {
+        esp_netif_ip_info_t ip_info;
+        esp_netif_get_ip_info(netif, &ip_info);
+        snprintf(ip_address, sizeof(ip_address), IPSTR, IP2STR(&ip_info.ip));
+    }
+    
+    // Get hotspot IP
+    char hotspot_ip[16] = "192.168.4.1";
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif) {
+        esp_netif_ip_info_t ap_ip_info;
+        esp_netif_get_ip_info(ap_netif, &ap_ip_info);
+        snprintf(hotspot_ip, sizeof(hotspot_ip), IPSTR, IP2STR(&ap_ip_info.ip));
+    }
+    
+    // Response buffer
+    char response[4500];
+    snprintf(response, sizeof(response), config_html,
+             mac_string,
+             device_mode,
+             wifi_class, wifi_status,
+             mqtt_class, mqtt_status,
+             ip_address,
+             g_config.wifi_ssid,
+             g_config.wifi_password,
+             g_config.mqtt_broker_url,
+             zone_inputs,
+             g_config.publish_interval_ms,
+             AP_SSID, AP_PASSWORD, hotspot_ip);
+    
+    ESP_LOGI(TAG, "Sending HTML response (%d bytes)", strlen(response));
+    httpd_resp_send(req, response, strlen(response));
+    return ESP_OK;
+}
+
+// Start HTTP server
+static void start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 80;
+    config.ctrl_port = 32768;
+    config.max_open_sockets = 7;
+    config.stack_size = 12288;
+    
+    ESP_LOGI(TAG, "Starting HTTP server on port %d", config.server_port);
+    
+    if (httpd_start(&server, &config) == ESP_OK) {
+        // Register URI handlers
+        httpd_uri_t root = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = root_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &root);
+        
+        httpd_uri_t sensor = {
+            .uri = "/sensor-data",
+            .method = HTTP_GET,
+            .handler = sensor_data_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &sensor);
+        
+        httpd_uri_t status = {
+            .uri = "/status",
+            .method = HTTP_GET,
+            .handler = status_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &status);
+        
+        httpd_uri_t wifi = {
+            .uri = "/save-wifi",
+            .method = HTTP_POST,
+            .handler = wifi_post_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &wifi);
+        
+        httpd_uri_t mqtt = {
+            .uri = "/save-mqtt",
+            .method = HTTP_POST,
+            .handler = mqtt_post_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &mqtt);
+        
+        httpd_uri_t thresholds = {
+            .uri = "/save-thresholds",
+            .method = HTTP_POST,
+            .handler = thresholds_post_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &thresholds);
+        
+        httpd_uri_t interval = {
+            .uri = "/save-interval",
+            .method = HTTP_POST,
+            .handler = interval_post_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &interval);
+        
+        httpd_uri_t cmd = {
+            .uri = "/command",
+            .method = HTTP_GET,
+            .handler = command_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &cmd);
+        
+        ESP_LOGI(TAG, "HTTP server started successfully");
+    } else {
+        ESP_LOGE(TAG, "Failed to start HTTP server");
+    }
+}
+
+/* Web Server Task */
+static void webserver_task(void *arg)
+{
+    ESP_LOGI(TAG, "Web server task started");
+    
+    // Wait a bit for network initialization
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    // Start HTTP server
+    start_webserver();
+    
+    // Keep task alive
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
+}
+
+/* Connectivity Manager Task - MODIFIED for permanent hotspot */
 static void connectivity_manager_task(void *arg)
 {
     esp_modem_dce_t *dce = (esp_modem_dce_t *)arg;
@@ -651,27 +1463,17 @@ static void connectivity_manager_task(void *arg)
     
     ESP_LOGI(TAG, "Connectivity Manager task started");
     
-    // First try WiFi
-    ESP_LOGI(TAG, "Attempting WiFi connection first...");
-    if (connect_wifi()) {
-        ESP_LOGI(TAG, "WiFi connected successfully - using as primary");
-        current_conn_mode = CONN_MODE_WIFI;
-    } else {
-        ESP_LOGW(TAG, "WiFi connection failed, will use GSM as backup");
-        // WiFi failed at startup - GSM will be activated in the main loop
-    }
-    
     while (1) {
         bool wifi_connected = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0);
         bool gsm_connected = ((xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) != 0);
         uint32_t current_time = esp_timer_get_time() / 1000000;
         
         if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // CRITICAL FIX: If WiFi is not connected AND GSM is not connected AND GSM is not activated
-            if (!wifi_connected && !gsm_connected && !gsm_activated) {
-                // Check if enough time has passed since last attempt
+            // If WiFi is not connected AND GSM is not connected
+            if (!wifi_connected && !gsm_connected) {
+                // Check if enough time has passed since last GSM attempt
                 if (current_time - last_gsm_activation_attempt > 60) { // Wait 60 seconds between attempts
-                    ESP_LOGI(TAG, "No network available - activating GSM PPP connection");
+                    ESP_LOGI(TAG, "No WiFi connection - activating GSM PPP connection");
                     
                     // Switch GSM modem to data mode
                     esp_err_t ret = esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA);
@@ -723,85 +1525,24 @@ static void connectivity_manager_task(void *arg)
             xSemaphoreGive(conn_mutex);
         }
         
-        // Periodically try to reconnect WiFi (if GSM is active)
-        if (current_conn_mode == CONN_MODE_GSM) {
-            static uint32_t last_wifi_attempt = 0;
-            
-            if (current_time - last_wifi_attempt > 300) { // Try every 5 minutes
-                ESP_LOGI(TAG, "Attempting WiFi reconnection while on GSM...");
-                
-                esp_wifi_start();
-                esp_wifi_connect();
-                
-                EventBits_t bits = xEventGroupWaitBits(event_group, 
-                    WIFI_CONNECTED_BIT,
-                    pdFALSE, pdFALSE, 
-                    pdMS_TO_TICKS(30000));
-                
-                if (!(bits & WIFI_CONNECTED_BIT)) {
-                    esp_wifi_disconnect();
-                    esp_wifi_stop();
-                }
-                
-                last_wifi_attempt = current_time;
-            }
-        }
-        
         vTaskDelay(pdMS_TO_TICKS(10000)); // Check every 10 seconds
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* MQTT task – works with both WiFi and GSM                                   */
-/* -------------------------------------------------------------------------- */
-
-typedef struct {
-    esp_modem_dce_t *dce;
-} mqtt_task_param_t;
-
+/* MQTT Task */
 static void mqtt_task(void *arg)
 {
-    mqtt_task_param_t *params = (mqtt_task_param_t *)arg;
-    esp_modem_dce_t *dce = params->dce;
-    vPortFree(params);
-
+    esp_modem_dce_t *dce = (esp_modem_dce_t *)arg;
     ESP_LOGI(TAG, "MQTT task started");
 
     esp_mqtt_client_handle_t mqtt_client = NULL;
     bool mqtt_started           = false;
     uint32_t last_mqtt_publish  = 0;
     uint32_t last_connection_check = 0;
-    uint32_t network_unavailable_start = 0;
-    bool emergency_gsm_triggered = false;
 
     while (1) {
         bool network_connected = ((xEventGroupGetBits(event_group) & 
                                  (WIFI_CONNECTED_BIT | GSM_CONNECTED_BIT)) != 0);
-        
-        // Emergency GSM activation if no network for too long
-        if (!network_connected) {
-            if (network_unavailable_start == 0) {
-                network_unavailable_start = esp_timer_get_time() / 1000000;
-                emergency_gsm_triggered = false;
-            }
-            
-            uint32_t unavailable_duration = (esp_timer_get_time() / 1000000) - network_unavailable_start;
-            
-            // If no network for 2 minutes, trigger emergency GSM activation
-            if (unavailable_duration > 120 && !emergency_gsm_triggered) {
-                ESP_LOGW(TAG, "No network for %d seconds - emergency GSM activation", unavailable_duration);
-                
-                // Signal connectivity manager to activate GSM
-                if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                    current_conn_mode = CONN_MODE_NONE; // Reset to trigger GSM activation
-                    xSemaphoreGive(conn_mutex);
-                }
-                emergency_gsm_triggered = true;
-            }
-        } else {
-            network_unavailable_start = 0;
-            emergency_gsm_triggered = false;
-        }
         
         if (!network_connected) {
             if (mqtt_client && mqtt_started) {
@@ -825,7 +1566,7 @@ static void mqtt_task(void *arg)
         /* MQTT client init */
         if (!mqtt_client) {
             esp_mqtt_client_config_t mqtt_config = {
-                .broker.address.uri         = "mqtt://zigron:zigron123@54.194.219.149:45055",
+                .broker.address.uri         = g_config.mqtt_broker_url,
                 .network.timeout_ms         = 20000,
                 .session.keepalive          = 60,
                 .network.disable_auto_reconnect = false,
@@ -917,40 +1658,55 @@ static void mqtt_task(void *arg)
     }
 }
 
-/* -------------------------------------------------------------------------- */
-/* app_main – initialises things and starts tasks                             */
-/* -------------------------------------------------------------------------- */
-
+/* app_main - MODIFIED for permanent hotspot */
 void app_main(void)
 {
     esp_log_level_set("esp_http_client", ESP_LOG_DEBUG);
     esp_log_level_set("esp_https_ota",   ESP_LOG_DEBUG);
     esp_log_level_set("wifi",            ESP_LOG_WARN);
 
+    // ESP_ERROR_CHECK(nvs_flash_erase());
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
 
+    // Load configuration from NVS
+    ret = load_config_from_nvs();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Using default configuration");
+        // Save defaults to NVS
+        memcpy(g_config.zone_lower, zone_lower_limit, sizeof(zone_lower_limit));
+        memcpy(g_config.zone_upper, zone_upper_limit, sizeof(zone_upper_limit));
+        save_config_to_nvs();
+    }
+
+    // Initialize MCP3002
     mcpInit(&dev, MCP3008, CONFIG_MISO_GPIO, CONFIG_MOSI_GPIO,
             CONFIG_SCLK_GPIO, CONFIG_CS_GPIO, MCP_SINGLE);
+    
+    // Get MAC address
     esp_read_mac(mac_addr, ESP_MAC_EFUSE_FACTORY);
     sprintf(mac_string, "%02X%02X%02X%02X%02X%02X",
             mac_addr[0], mac_addr[1], mac_addr[2],
             mac_addr[3], mac_addr[4], mac_addr[5]);
     ESP_LOGI(TAG, "MAC address %s", mac_string);
 
+    // Create synchronization primitives
     event_group = xEventGroupCreate();
     data_mutex  = xSemaphoreCreateMutex();
     conn_mutex  = xSemaphoreCreateMutex();
 
+    // Initialize network stack
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
+    
+    // Register IP event handlers
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, &on_ppp_changed, NULL));
 
-    // Initialize WiFi first (priority connection)
+    // Initialize WiFi in AP+STA mode for permanent hotspot
     init_wifi();
 
     // GSM/PPP setup (backup connection)
@@ -968,25 +1724,32 @@ void app_main(void)
     dte_config.uart_config.rx_buffer_size = 2048;
     dte_config.uart_config.tx_buffer_size = 1024;
 
+    // Temporarily disable watchdog for initialization
     ESP_ERROR_CHECK(esp_task_wdt_deinit());
     ESP_LOGI(TAG, "Watchdog temporarily disabled for initialization");
 
+    // Setup GPIOs
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_LED_STATUS_PIN,   GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN,  GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN,   GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_BUZZER_STATUS_PIN, GPIO_MODE_INPUT);
+    gpio_set_direction((gpio_num_t)39, GPIO_MODE_INPUT); // Digital input pin
 
-    gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 1); vTaskDelay(pdMS_TO_TICKS(100));
+    // Reset modem
+    gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 1); 
+    vTaskDelay(pdMS_TO_TICKS(100));
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 0);
-    gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, 0);  vTaskDelay(pdMS_TO_TICKS(100));
+    gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(100));
 
+    // Initialize GSM modem
     esp_modem_dce_t *dce = esp_modem_new_dev(ESP_MODEM_DCE_EC20, &dte_config, &dce_config, esp_netif);
     ESP_LOGI(TAG, "Waiting for GSM modem to boot (15 seconds)...");
     vTaskDelay(pdMS_TO_TICKS(15000));
     assert(dce);
 
-    xEventGroupClearBits(event_group, CONNECT_BIT | GOT_DATA_BIT | USB_DISCONNECTED_BIT | 
-                       DISCONNECT_BIT | OTA_TRIGGER_BIT | WIFI_CONNECTED_BIT | 
-                       GSM_CONNECTED_BIT | MQTT_CONNECTED_BIT);
+    // Clear all event bits
+    xEventGroupClearBits(event_group, WIFI_CONNECTED_BIT | GSM_CONNECTED_BIT | MQTT_CONNECTED_BIT | OTA_TRIGGER_BIT);
 
     // Test GSM modem communication
     ESP_LOGI(TAG, "Testing basic GSM modem communication...");
@@ -1006,7 +1769,7 @@ void app_main(void)
     }
 
     if (gsm_available && !check_network_registration(dce)) {
-        ESP_LOGW(TAG, "GSM network registration failed - will use WiFi only");
+        ESP_LOGW(TAG, "GSM network registration failed - will use as fallback only");
         gsm_available = false;
     }
 
@@ -1023,45 +1786,24 @@ void app_main(void)
                 }
             }
         }
-
-#if CONFIG_EXAMPLE_NEED_SIM_PIN == 1
-        {
-            bool pin_ok = false;
-            if (esp_modem_read_pin(dce, &pin_ok) == ESP_OK && pin_ok == false) {
-                if (esp_modem_set_pin(dce, CONFIG_EXAMPLE_SIM_PIN) == ESP_OK) {
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                } else {
-                    ESP_LOGW(TAG, "Failed to set SIM PIN");
-                }
-            }
-        }
-#endif
-
-        // Quick test of GSM PPP capability
-        ESP_LOGI(TAG, "Testing GSM PPP capability...");
-        ret = esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA);
-        if (ret == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(5000)); // Wait a bit
-            EventBits_t bits = xEventGroupWaitBits(event_group, 
-                GSM_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(10000));
-            
-            if (bits & GSM_CONNECTED_BIT) {
-                ESP_LOGI(TAG, "GSM PPP test successful");
-                // Go back to command mode for now
-                esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
-            } else {
-                ESP_LOGW(TAG, "GSM PPP test timed out (will still try as fallback)");
-                esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
-            }
-        } else {
-            ESP_LOGE(TAG, "GSM data mode test failed: %s", esp_err_to_name(ret));
-        }
     }
 
     /* Start tasks */
     BaseType_t xRet;
 
-    // Start connectivity manager first
+    // Start web server task
+    xRet = xTaskCreate(webserver_task, "webserver_task", 8192, NULL, 4, &webserver_task_handle);
+    if (xRet != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create webserver task");
+    }
+
+    // Start WiFi connection task
+    xRet = xTaskCreate(wifi_connection_task, "wifi_conn_task", 8192, NULL, 4, &wifi_task_handle);
+    if (xRet != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create WiFi connection task");
+    }
+
+    // Start connectivity manager
     xRet = xTaskCreate(connectivity_manager_task, "conn_mgr", 4096, dce, 4, NULL);
     if (xRet != pdPASS) {
         ESP_LOGE(TAG, "Failed to create connectivity manager task");
@@ -1075,17 +1817,9 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create sensor task");
     }
 
-    mqtt_task_param_t *params = pvPortMalloc(sizeof(mqtt_task_param_t));
-    if (!params) {
-        ESP_LOGE(TAG, "Failed to allocate MQTT task params");
-        return;
-    }
-    params->dce = dce;
-
-    xRet = xTaskCreate(mqtt_task, "mqtt_task", 8192, params, 5, NULL);
+    xRet = xTaskCreate(mqtt_task, "mqtt_task", 8192, dce, 5, NULL);
     if (xRet != pdPASS) {
         ESP_LOGE(TAG, "Failed to create MQTT task");
-        vPortFree(params);
     }
 
     xRet = xTaskCreate(ota_task, "ota_task", 8192, NULL, 5, NULL);
@@ -1093,5 +1827,7 @@ void app_main(void)
         ESP_LOGE(TAG, "Failed to create OTA task");
     }
 
-    ESP_LOGI(TAG, "app_main finished bootstrapping; tasks are running");
+    ESP_LOGI(TAG, "System fully started with PERMANENT hotspot functionality");
+    ESP_LOGI(TAG, "Hotspot is ALWAYS active at SSID: %s, Password: %s", AP_SSID, AP_PASSWORD);
+    ESP_LOGI(TAG, "Connect to hotspot anytime at: http://192.168.4.1 to configure device");
 }
