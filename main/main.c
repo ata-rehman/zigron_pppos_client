@@ -11,6 +11,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include <ctype.h>
+#include <cJSON.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -40,7 +41,7 @@
 #include "esp_wifi_default.h"
 
 #define PACKET_TIMEOUT      30          // 30 seconds
-#define FW_VER              "0.04"      // Updated version
+#define FW_VER              "0.05"      // Updated version with MQTT config
 #define EXAMPLE_FLOW_CONTROL ESP_MODEM_FLOW_CONTROL_NONE
 #define WIFI_CONNECT_TIMEOUT_MS 30000   // 30 seconds WiFi timeout
 #define MAX_WIFI_RETRIES   3
@@ -61,6 +62,7 @@ static const int WIFI_CONNECTED_BIT   = BIT0;   // WiFi is connected
 static const int GSM_CONNECTED_BIT    = BIT1;   // GSM/PPP is connected
 static const int MQTT_CONNECTED_BIT   = BIT2;   // MQTT is connected
 static const int OTA_TRIGGER_BIT      = BIT3;   // MQTT-triggered OTA
+static const int RECONFIG_TRIGGER_BIT = BIT4;   // Reconfiguration triggered
 
 /* Connectivity mode */
 typedef enum {
@@ -155,6 +157,7 @@ static void ota_task(void *arg);
 static void connectivity_manager_task(void *arg);
 static void webserver_task(void *arg);
 static void wifi_connection_task(void *arg);
+static void handle_mqtt_config_command(const char *payload, int payload_len);
 
 /* NVS Configuration Functions */
 static esp_err_t save_config_to_nvs(void)
@@ -212,6 +215,167 @@ static esp_err_t load_config_from_nvs(void)
     
     nvs_close(handle);
     return err;
+}
+
+/* Apply WiFi configuration and reconnect */
+static void apply_wifi_configuration(void)
+{
+    ESP_LOGI(TAG, "Applying new WiFi configuration");
+    
+    // Configure WiFi station
+    wifi_config_t wifi_config_sta = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .pmf_cfg = {
+                .capable = true,
+                .required = false
+            },
+        },
+    };
+    
+    strncpy((char*)wifi_config_sta.sta.ssid, g_config.wifi_ssid, sizeof(wifi_config_sta.sta.ssid));
+    strncpy((char*)wifi_config_sta.sta.password, g_config.wifi_password, sizeof(wifi_config_sta.sta.password));
+    
+    // Update WiFi configuration
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config_sta));
+    
+    // If currently connected, disconnect and reconnect with new settings
+    if ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) {
+        ESP_LOGI(TAG, "Disconnecting from current WiFi to apply new settings...");
+        esp_wifi_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    
+    // Trigger reconnection
+    esp_wifi_connect();
+}
+
+/* Handle MQTT configuration command */
+static void handle_mqtt_config_command(const char *payload, int payload_len)
+{
+    char payload_copy[256];
+    if (payload_len >= sizeof(payload_copy)) {
+        ESP_LOGE(TAG, "MQTT config payload too large");
+        return;
+    }
+    
+    memcpy(payload_copy, payload, payload_len);
+    payload_copy[payload_len] = '\0';
+    
+    ESP_LOGI(TAG, "Processing MQTT config command: %s", payload_copy);
+    
+    // Parse JSON
+    cJSON *root = cJSON_Parse(payload_copy);
+    if (root == NULL) {
+        ESP_LOGE(TAG, "Failed to parse JSON config");
+        return;
+    }
+    
+    bool config_changed = false;
+    
+    // Parse WiFi SSID
+    cJSON *wifi_ssid = cJSON_GetObjectItem(root, "wifi_ssid");
+    if (cJSON_IsString(wifi_ssid) && wifi_ssid->valuestring != NULL) {
+        if (strlen(wifi_ssid->valuestring) > 0 && 
+            strcmp(wifi_ssid->valuestring, g_config.wifi_ssid) != 0) {
+            strncpy(g_config.wifi_ssid, wifi_ssid->valuestring, sizeof(g_config.wifi_ssid)-1);
+            g_config.wifi_ssid[sizeof(g_config.wifi_ssid)-1] = '\0';
+            config_changed = true;
+            ESP_LOGI(TAG, "MQTT: New WiFi SSID: %s", g_config.wifi_ssid);
+        }
+    }
+    
+    // Parse WiFi Password
+    cJSON *wifi_password = cJSON_GetObjectItem(root, "wifi_password");
+    if (cJSON_IsString(wifi_password) && wifi_password->valuestring != NULL) {
+        if (strcmp(wifi_password->valuestring, g_config.wifi_password) != 0) {
+            strncpy(g_config.wifi_password, wifi_password->valuestring, sizeof(g_config.wifi_password)-1);
+            g_config.wifi_password[sizeof(g_config.wifi_password)-1] = '\0';
+            config_changed = true;
+            ESP_LOGI(TAG, "MQTT: WiFi Password updated");
+        }
+    }
+    
+    // Parse MQTT Broker URL
+    cJSON *mqtt_broker = cJSON_GetObjectItem(root, "mqtt_broker");
+    if (cJSON_IsString(mqtt_broker) && mqtt_broker->valuestring != NULL) {
+        if (strlen(mqtt_broker->valuestring) > 0 && 
+            strcmp(mqtt_broker->valuestring, g_config.mqtt_broker_url) != 0) {
+            strncpy(g_config.mqtt_broker_url, mqtt_broker->valuestring, sizeof(g_config.mqtt_broker_url)-1);
+            g_config.mqtt_broker_url[sizeof(g_config.mqtt_broker_url)-1] = '\0';
+            config_changed = true;
+            ESP_LOGI(TAG, "MQTT: New Broker URL: %s", g_config.mqtt_broker_url);
+        }
+    }
+    
+    // Parse Publish Interval
+    cJSON *publish_interval = cJSON_GetObjectItem(root, "publish_interval");
+    if (cJSON_IsNumber(publish_interval)) {
+        uint32_t new_interval = publish_interval->valueint;
+        if (new_interval >= 1000 && new_interval <= 30000 && 
+            new_interval != g_config.publish_interval_ms) {
+            g_config.publish_interval_ms = new_interval;
+            config_changed = true;
+            ESP_LOGI(TAG, "MQTT: New publish interval: %d ms", g_config.publish_interval_ms);
+        }
+    }
+    
+    // Parse Thresholds
+    cJSON *thresholds = cJSON_GetObjectItem(root, "thresholds");
+    if (cJSON_IsArray(thresholds)) {
+        int array_size = cJSON_GetArraySize(thresholds);
+        if (array_size == TOTAL_ZONE) {
+            for (int i = 0; i < TOTAL_ZONE && i < array_size; i++) {
+                cJSON *threshold = cJSON_GetArrayItem(thresholds, i);
+                if (cJSON_IsObject(threshold)) {
+                    cJSON *low = cJSON_GetObjectItem(threshold, "low");
+                    cJSON *high = cJSON_GetObjectItem(threshold, "high");
+                    
+                    if (cJSON_IsNumber(low) && cJSON_IsNumber(high)) {
+                        uint16_t new_low = low->valueint;
+                        uint16_t new_high = high->valueint;
+                        
+                        if (new_low != g_config.zone_lower[i] || new_high != g_config.zone_upper[i]) {
+                            g_config.zone_lower[i] = new_low;
+                            g_config.zone_upper[i] = new_high;
+                            config_changed = true;
+                            
+                            // Update runtime thresholds
+                            if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                                zone_lower_limit[i] = new_low;
+                                zone_upper_limit[i] = new_high;
+                                xSemaphoreGive(data_mutex);
+                            }
+                            
+                            ESP_LOGI(TAG, "MQTT: Zone %d thresholds: low=%d, high=%d", i, new_low, new_high);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    cJSON_Delete(root);
+    
+    if (config_changed) {
+        // Save to NVS
+        esp_err_t err = save_config_to_nvs();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Configuration saved to NVS via MQTT");
+            
+            // Apply WiFi configuration if changed
+            if (strlen(g_config.wifi_ssid) > 0) {
+                apply_wifi_configuration();
+            }
+            
+            // Signal reconfiguration
+            xEventGroupSetBits(event_group, RECONFIG_TRIGGER_BIT);
+        } else {
+            ESP_LOGE(TAG, "Failed to save configuration to NVS: %s", esp_err_to_name(err));
+        }
+    } else {
+        ESP_LOGI(TAG, "No configuration changes detected in MQTT command");
+    }
 }
 
 /* Hotspot Functions */
@@ -393,7 +557,7 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
     }
 }
 
-/* WiFi Connection Task - MODIFIED to keep hotspot always active */
+/* WiFi Connection Task */
 static void wifi_connection_task(void *arg)
 {
     ESP_LOGI(TAG, "WiFi connection task started");
@@ -403,6 +567,13 @@ static void wifi_connection_task(void *arg)
     
     // Main WiFi connection loop
     while (1) {
+        // Check if reconfiguration was requested
+        EventBits_t bits = xEventGroupGetBits(event_group);
+        if (bits & RECONFIG_TRIGGER_BIT) {
+            xEventGroupClearBits(event_group, RECONFIG_TRIGGER_BIT);
+            ESP_LOGI(TAG, "Reconfiguration triggered, re-evaluating WiFi connection");
+        }
+        
         // Check if WiFi credentials are configured
         if (strlen(g_config.wifi_ssid) == 0) {
             ESP_LOGW(TAG, "WiFi SSID not configured. Hotspot is active for configuration.");
@@ -452,6 +623,7 @@ static void wifi_connection_task(void *arg)
     }
 }
 
+/* Sensor Task */
 static void sensor_task(void *arg)
 {
     ESP_LOGI(TAG, "Sensor task started");
@@ -510,7 +682,7 @@ static void sensor_task(void *arg)
     }
 }
 
-/* GSM/PPP Functions (unchanged from your original) */
+/* GSM/PPP Functions */
 static bool check_network_registration(esp_modem_dce_t *dce)
 {
     int rssi, ber;
@@ -615,7 +787,7 @@ static void check_ppp_connection(esp_modem_dce_t *dce, esp_mqtt_client_handle_t 
     }
 }
 
-/* MQTT Event Handler */
+/* MQTT Event Handler - UPDATED with config commands */
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
@@ -631,6 +803,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         
         xEventGroupSetBits(event_group, MQTT_CONNECTED_BIT);
         
+        // Subscribe to standard topics
         topic_buff[0] = 0;
         sprintf(topic_buff, "/ZIGRON/%s/CLEAR", mac_string);
         msg_id = esp_mqtt_client_subscribe(client, topic_buff, 0);
@@ -640,6 +813,23 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         sprintf(topic_buff, "/ZIGRON/%s/COMMAND", mac_string);
         msg_id = esp_mqtt_client_subscribe(client, topic_buff, 0);
         ESP_LOGI(TAG, "sent subscribe COMMAND, msg_id=%d", msg_id);
+        
+        // Subscribe to configuration topic
+        topic_buff[0] = 0;
+        sprintf(topic_buff, "/ZIGRON/%s/CONFIG", mac_string);
+        msg_id = esp_mqtt_client_subscribe(client, topic_buff, 0);
+        ESP_LOGI(TAG, "sent subscribe CONFIG, msg_id=%d", msg_id);
+        
+        // Publish configuration status
+        char config_status[256];
+        snprintf(config_status, sizeof(config_status),
+            "{\"wifi_ssid\":\"%s\",\"mqtt_broker\":\"%s\",\"status\":\"connected\"}",
+            g_config.wifi_ssid, g_config.mqtt_broker_url);
+        
+        sprintf(topic_buff, "/ZIGRON/%s/STATUS", mac_string);
+        esp_mqtt_client_publish(client, topic_buff, config_status, 0, 0, 0);
+        ESP_LOGI(TAG, "Published configuration status");
+        
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -660,9 +850,31 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
         break;
 
     case MQTT_EVENT_DATA: {
+
         ESP_LOGI(TAG, "MQTT_EVENT_DATA");
         printf("TOPIC=%.*s\r\n", event->topic_len, event->topic);
         printf("DATA=%.*s\r\n", event->data_len, event->data);
+
+        /* Check if this is a CLEAR topic */
+        char topic[64];
+        int topic_len = event->topic_len < 63 ? event->topic_len : 63;
+        memcpy(topic, event->topic, topic_len);
+        topic[topic_len] = '\0';
+        
+        char clear_topic[64];
+        snprintf(clear_topic, sizeof(clear_topic), "/ZIGRON/%s/CLEAR", mac_string);
+        
+        /* Clear alarm state only on CLEAR topics */
+        if (strncmp(topic, clear_topic, strlen(clear_topic)) == 0) {
+            if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                for (int i = 0; i < TOTAL_ZONE; i++) {
+                    zone_alert_state[i] = 0;
+                }
+                alert_flg   = 0;
+                loop_counter = PACKET_TIMEOUT - 1;
+                xSemaphoreGive(data_mutex);
+            }
+        }
 
         /* Clear alarm state on any data */
         if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -674,13 +886,22 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             xSemaphoreGive(data_mutex);
         }
 
-        /* OTA trigger: /ZIGRON/<MAC>/COMMAND topic with payload "OTA" */
+        memcpy(topic, event->topic, topic_len);
+        topic[topic_len] = '\0';
+        
+        char config_topic[64];
+        snprintf(config_topic, sizeof(config_topic), "/ZIGRON/%s/CONFIG", mac_string);
+        
         char cmd_topic[64];
         snprintf(cmd_topic, sizeof(cmd_topic), "/ZIGRON/%s/COMMAND", mac_string);
-
-        if (event->topic_len == strlen(cmd_topic) &&
-            strncmp(event->topic, cmd_topic, event->topic_len) == 0) {
-
+        
+        /* Handle CONFIG topic */
+        if (strncmp(topic, config_topic, strlen(config_topic)) == 0) {
+            ESP_LOGI(TAG, "Configuration command received via MQTT");
+            handle_mqtt_config_command(event->data, event->data_len);
+        }
+        /* Handle COMMAND topic */
+        else if (strncmp(topic, cmd_topic, strlen(cmd_topic)) == 0) {
             char payload[64] = {0};
             int len = event->data_len < (int)(sizeof(payload) - 1) ? event->data_len : (int)(sizeof(payload) - 1);
             memcpy(payload, event->data, len);
@@ -688,7 +909,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
 
             ESP_LOGI(TAG, "COMMAND payload: '%s'", payload);
 
-            /* Make case-insensitive "OTA" check */
+            /* Make case-insensitive check */
             for (int i = 0; i < len; ++i) {
                 payload[i] = (char)toupper((unsigned char)payload[i]);
             }
@@ -696,6 +917,42 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             if (strcmp(payload, "OTA") == 0) {
                 ESP_LOGI(TAG, "OTA command received via MQTT, setting OTA trigger bit");
                 xEventGroupSetBits(event_group, OTA_TRIGGER_BIT);
+            }
+            else if (strcmp(payload, "GET_CONFIG") == 0) {
+                ESP_LOGI(TAG, "GET_CONFIG command received via MQTT");
+                // Publish current configuration
+                char config_json[1024];
+                snprintf(config_json, sizeof(config_json),
+                    "{\"wifi_ssid\":\"%s\","
+                    "\"wifi_password\":\"%s\","
+                    "\"mqtt_broker\":\"%s\","
+                    "\"publish_interval\":%lu,"
+                    "\"thresholds\":[",
+                    g_config.wifi_ssid,
+                    g_config.wifi_password,
+                    g_config.mqtt_broker_url,
+                    g_config.publish_interval_ms);
+                
+                // Add thresholds
+                char thresholds_str[256];
+                thresholds_str[0] = '\0';
+                for (int i = 0; i < TOTAL_ZONE; i++) {
+                    char zone_str[64];
+                    snprintf(zone_str, sizeof(zone_str), 
+                        "{\"zone\":%d,\"low\":%d,\"high\":%d}%s",
+                        i, g_config.zone_lower[i], g_config.zone_upper[i],
+                        (i < TOTAL_ZONE - 1) ? "," : "");
+                    strcat(thresholds_str, zone_str);
+                }
+                
+                strcat(config_json, thresholds_str);
+                strcat(config_json, "]}");
+                
+                // Publish to config response topic
+                char response_topic[64];
+                snprintf(response_topic, sizeof(response_topic), "/ZIGRON/%s/CONFIG_RESPONSE", mac_string);
+                esp_mqtt_client_publish(client, response_topic, config_json, 0, 0, 0);
+                ESP_LOGI(TAG, "Published configuration to %s", response_topic);
             }
         }
         break;
@@ -832,7 +1089,7 @@ static void ota_task(void *arg)
     }
 }
 
-/* HTTP Server Handlers */
+/* HTTP Server Handlers (remain mostly the same, but updated for consistency) */
 
 // Helper function to parse form data
 static char* urldecode(char *dst, const char *src, size_t dstsize) {
@@ -862,13 +1119,15 @@ static char* urldecode(char *dst, const char *src, size_t dstsize) {
 // Handler for status information
 static esp_err_t status_get_handler(httpd_req_t *req)
 {
-    char json[300];
+    char json[512];
     
     const char* device_mode = "AP+STA Mode";
     const char* wifi_status = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
     const char* wifi_class = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
     const char* mqtt_status = ((xEventGroupGetBits(event_group) & MQTT_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
     const char* mqtt_class = ((xEventGroupGetBits(event_group) & MQTT_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
+    const char* gsm_status = ((xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
+    const char* gsm_class = ((xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
     
     char ip_address[16] = "Not Available";
     esp_netif_t* netif = NULL;
@@ -882,9 +1141,12 @@ static esp_err_t status_get_handler(httpd_req_t *req)
     }
     
     snprintf(json, sizeof(json),
-        "{\"mode\":\"%s\",\"wifi\":\"%s\",\"mqtt\":\"%s\","
-        "\"ip\":\"%s\",\"wifi_class\":\"%s\",\"mqtt_class\":\"%s\"}",
-        device_mode, wifi_status, mqtt_status, ip_address, wifi_class, mqtt_class);
+        "{\"mode\":\"%s\",\"wifi\":\"%s\",\"mqtt\":\"%s\",\"gsm\":\"%s\","
+        "\"ip\":\"%s\",\"wifi_class\":\"%s\",\"mqtt_class\":\"%s\",\"gsm_class\":\"%s\","
+        "\"wifi_ssid\":\"%s\",\"mqtt_broker\":\"%s\"}",
+        device_mode, wifi_status, mqtt_status, gsm_status, ip_address, 
+        wifi_class, mqtt_class, gsm_class,
+        g_config.wifi_ssid, g_config.mqtt_broker_url);
     
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, strlen(json));
@@ -925,7 +1187,7 @@ static esp_err_t sensor_data_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// Handler for Wi-Fi configuration
+// Handler for Wi-Fi configuration - FIXED VERSION
 static esp_err_t wifi_post_handler(httpd_req_t *req)
 {
     char buf[256];
@@ -953,45 +1215,40 @@ static esp_err_t wifi_post_handler(httpd_req_t *req)
         token = strtok(NULL, "&");
     }
     
-    // Save to configuration
-    if (strlen(ssid) > 0) {
-        strncpy(g_config.wifi_ssid, ssid, sizeof(g_config.wifi_ssid)-1);
-        g_config.wifi_ssid[sizeof(g_config.wifi_ssid)-1] = '\0';
+    // Validate input
+    if (strlen(ssid) == 0) {
+        httpd_resp_send(req, "Error: WiFi SSID cannot be empty", -1);
+        return ESP_OK;
     }
+    
+    // Save to configuration
+    strncpy(g_config.wifi_ssid, ssid, sizeof(g_config.wifi_ssid)-1);
+    g_config.wifi_ssid[sizeof(g_config.wifi_ssid)-1] = '\0';
+    
     if (strlen(password) > 0) {
         strncpy(g_config.wifi_password, password, sizeof(g_config.wifi_password)-1);
         g_config.wifi_password[sizeof(g_config.wifi_password)-1] = '\0';
+    } else {
+        // Clear password if empty
+        memset(g_config.wifi_password, 0, sizeof(g_config.wifi_password));
     }
     
-    save_config_to_nvs();
-    
-    httpd_resp_send(req, "Wi-Fi settings saved. Device will attempt to connect to the new network...", -1);
-    
-    // Signal WiFi task to reconnect with new credentials
-    if (wifi_task_handle != NULL) {
-        xEventGroupClearBits(event_group, WIFI_CONNECTED_BIT);
-        
-        // Reconfigure STA with new credentials
-        wifi_config_t wifi_config_sta = {
-            .sta = {
-                .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-                .pmf_cfg = {
-                    .capable = true,
-                    .required = false
-                },
-            },
-        };
-        
-        strncpy((char*)wifi_config_sta.sta.ssid, g_config.wifi_ssid, sizeof(wifi_config_sta.sta.ssid));
-        strncpy((char*)wifi_config_sta.sta.password, g_config.wifi_password, sizeof(wifi_config_sta.sta.password));
-        
-        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config_sta));
-        
-        // Reconnect
-        esp_wifi_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        esp_wifi_connect();
+    // Save to NVS
+    esp_err_t err = save_config_to_nvs();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to save config to NVS: %s", esp_err_to_name(err));
+        httpd_resp_send(req, "Error: Failed to save configuration to storage", -1);
+        return ESP_OK;
     }
+    
+    ESP_LOGI(TAG, "WiFi credentials updated via web interface:");
+    ESP_LOGI(TAG, "  SSID: %s", g_config.wifi_ssid);
+    ESP_LOGI(TAG, "  Password: %s", g_config.wifi_password);
+    
+    httpd_resp_send(req, "Wi-Fi settings saved successfully! Device will attempt to connect to the new network...", -1);
+    
+    // Apply WiFi configuration
+    apply_wifi_configuration();
     
     return ESP_OK;
 }
@@ -1018,9 +1275,14 @@ static esp_err_t mqtt_post_handler(httpd_req_t *req)
     if (strlen(broker) > 0) {
         strncpy(g_config.mqtt_broker_url, broker, sizeof(g_config.mqtt_broker_url)-1);
         g_config.mqtt_broker_url[sizeof(g_config.mqtt_broker_url)-1] = '\0';
-        save_config_to_nvs();
         
-        httpd_resp_send(req, "MQTT settings saved.", -1);
+        esp_err_t err = save_config_to_nvs();
+        if (err == ESP_OK) {
+            httpd_resp_send(req, "MQTT settings saved. Device will reconnect to the new broker...", -1);
+            xEventGroupSetBits(event_group, RECONFIG_TRIGGER_BIT);
+        } else {
+            httpd_resp_send(req, "Error: Failed to save MQTT settings", -1);
+        }
     } else {
         httpd_resp_send(req, "Invalid broker URL", -1);
     }
@@ -1159,6 +1421,21 @@ static esp_err_t command_get_handler(httpd_req_t *req)
                 xSemaphoreGive(data_mutex);
             }
             httpd_resp_send(req, "Alerts cleared", -1);
+        } else if (strcmp(cmd, "GET_CONFIG") == 0) {
+            ESP_LOGI(TAG, "Get config command received via web interface");
+            char config_json[1024];
+            snprintf(config_json, sizeof(config_json),
+                "{\"wifi_ssid\":\"%s\","
+                "\"wifi_password\":\"%s\","
+                "\"mqtt_broker\":\"%s\","
+                "\"publish_interval\":%lu}",
+                g_config.wifi_ssid,
+                g_config.wifi_password,
+                g_config.mqtt_broker_url,
+                g_config.publish_interval_ms);
+            
+            httpd_resp_set_type(req, "application/json");
+            httpd_resp_send(req, config_json, strlen(config_json));
         } else {
             httpd_resp_send(req, "Unknown command", -1);
         }
@@ -1169,7 +1446,7 @@ static esp_err_t command_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-// HTML for web interface
+/* HTML for web interface - UPDATED with better config display */
 static const char* config_html = 
 "<!DOCTYPE html>"
 "<html><head><title>Zigron Device</title>"
@@ -1191,6 +1468,11 @@ static const char* config_html =
 ".form-section{margin-bottom:15px;}"
 ".status-connected{color:green;}"
 ".status-disconnected{color:red;}"
+".status-box{margin:5px 0;padding:5px;border-radius:3px;}"
+".wifi-status{background:#e3f2fd;}"
+".mqtt-status{background:#f3e5f5;}"
+".gsm-status{background:#e8f5e8;}"
+".config-info{background:#fff3cd;padding:10px;border-radius:5px;margin:10px 0;}"
 "</style></head>"
 "<body>"
 "<div class='container'>"
@@ -1199,9 +1481,16 @@ static const char* config_html =
 "<h2>Device Status</h2>"
 "<div id='device-status'>"
 "<p>Device Mode: <span id='mode-status'>%s</span></p>"
-"<p>WiFi Status: <span id='wifi-status' class='%s'>%s</span></p>"
-"<p>MQTT Status: <span id='mqtt-status' class='%s'>%s</span></p>"
+"<div class='status-box wifi-status'>WiFi Status: <span id='wifi-status' class='%s'>%s</span></div>"
+"<div class='status-box gsm-status'>GSM Status: <span id='gsm-status' class='%s'>%s</span></div>"
+"<div class='status-box mqtt-status'>MQTT Status: <span id='mqtt-status' class='%s'>%s</span></div>"
 "<p>Hotspot IP: <span id='ip-address'>%s</span></p>"
+"<p>Current Connection: <span id='current-conn'>%s</span></p>"
+"</div>"
+"<div class='config-info'>"
+"<p><strong>Current Configuration:</strong></p>"
+"<p>WiFi SSID: <span id='config-wifi-ssid'>%s</span></p>"
+"<p>MQTT Broker: <span id='config-mqtt-broker'>%s</span></p>"
 "</div>"
 "</div>"
 "<div class='section'>"
@@ -1225,6 +1514,7 @@ static const char* config_html =
 "<input type='text' name='broker' placeholder='Broker URL (e.g., mqtt://broker.example.com)' value='%s'>"
 "<button type='submit'>Save MQTT</button>"
 "</form>"
+"<p><small><i>Note: You can also update configuration via MQTT topic: /ZIGRON/%s/CONFIG</i></small></p>"
 "</div>"
 "<div class='form-section'>"
 "<h3>Thresholds</h3>"
@@ -1246,6 +1536,7 @@ static const char* config_html =
 "<button onclick='sendCmd(\"OTA\")'>OTA Update</button>"
 "<button onclick='sendCmd(\"RESET\")'>Restart Device</button>"
 "<button onclick='sendCmd(\"CLEAR\")'>Clear Alerts</button>"
+"<button onclick='sendCmd(\"GET_CONFIG\")'>Get Config</button>"
 "<button onclick='window.location.reload()'>Refresh Page</button>"
 "</div>"
 "<div class='section'>"
@@ -1255,19 +1546,59 @@ static const char* config_html =
 "<p><strong>Hotspot IP:</strong> %s</p>"
 "<p><small><i>Hotspot is ALWAYS active. Connect to configure device anytime.</i></small></p>"
 "</div>"
+"<div class='section'>"
+"<h2>MQTT Configuration</h2>"
+"<p><strong>Configuration Topic:</strong> /ZIGRON/%s/CONFIG</p>"
+"<p><strong>Configuration JSON Format:</strong></p>"
+"<pre style='background:#f0f0f0;padding:10px;border-radius:5px;font-size:12px;'>"
+"{\n"
+"  \"wifi_ssid\": \"YourSSID\",\n"
+"  \"wifi_password\": \"YourPassword\",\n"
+"  \"mqtt_broker\": \"mqtt://broker.example.com\",\n"
+"  \"publish_interval\": 5000,\n"
+"  \"thresholds\": [\n"
+"    {\"zone\": 0, \"low\": 0, \"high\": 900},\n"
+"    {\"zone\": 1, \"low\": 0, \"high\": 900}\n"
+"  ]\n"
+"}"
+"</pre>"
+"<p><strong>Get Configuration:</strong> Send \"GET_CONFIG\" to /ZIGRON/%s/COMMAND topic</p>"
+"</div>"
 "</div>"
 "<script>"
 "function sendCmd(cmd){"
-"fetch('/command?cmd='+cmd).then(r=>alert('Command Sent: '+cmd));"
+"fetch('/command?cmd='+cmd).then(r=>r.text()).then(data=>{"
+"if(cmd === 'GET_CONFIG'){"
+"try{"
+"let config = JSON.parse(data);"
+"alert('Current Configuration:\\n' + "
+"'WiFi SSID: ' + config.wifi_ssid + '\\n' + "
+"'MQTT Broker: ' + config.mqtt_broker + '\\n' + "
+"'Publish Interval: ' + config.publish_interval + 'ms');"
+"}catch(e){"
+"alert('Response: ' + data);"
+"}"
+"}else{"
+"alert('Command Sent: ' + cmd + '\\nResponse: ' + data);"
+"}"
+"});"
 "}"
 "function updateStatus(){"
 "fetch('/status').then(r=>r.json()).then(data=>{"
 "document.getElementById('mode-status').textContent = data.mode;"
 "document.getElementById('wifi-status').textContent = data.wifi;"
+"document.getElementById('gsm-status').textContent = data.gsm;"
 "document.getElementById('mqtt-status').textContent = data.mqtt;"
 "document.getElementById('ip-address').textContent = data.ip;"
+"document.getElementById('config-wifi-ssid').textContent = data.wifi_ssid;"
+"document.getElementById('config-mqtt-broker').textContent = data.mqtt_broker;"
 "document.getElementById('wifi-status').className = data.wifi === 'Connected' ? 'status-connected' : 'status-disconnected';"
+"document.getElementById('gsm-status').className = data.gsm === 'Connected' ? 'status-connected' : 'status-disconnected';"
 "document.getElementById('mqtt-status').className = data.mqtt === 'Connected' ? 'status-connected' : 'status-disconnected';"
+"let currentConn = 'None';"
+"if(data.wifi === 'Connected') currentConn = 'WiFi';"
+"else if(data.gsm === 'Connected') currentConn = 'GSM';"
+"document.getElementById('current-conn').textContent = currentConn;"
 "});"
 "}"
 "function updateSensorData(){"
@@ -1313,6 +1644,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     const char* device_mode = "AP+STA Mode";
     const char* wifi_status = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
     const char* wifi_class = ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
+    const char* gsm_status = ((xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
+    const char* gsm_class = ((xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
     const char* mqtt_status = ((xEventGroupGetBits(event_group) & MQTT_CONNECTED_BIT) != 0) ? "Connected" : "Disconnected";
     const char* mqtt_class = ((xEventGroupGetBits(event_group) & MQTT_CONNECTED_BIT) != 0) ? "status-connected" : "status-disconnected";
     
@@ -1334,20 +1667,34 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         snprintf(hotspot_ip, sizeof(hotspot_ip), IPSTR, IP2STR(&ap_ip_info.ip));
     }
     
+    // Determine current connection
+    const char* current_conn = "None";
+    if ((xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT) != 0) {
+        current_conn = "WiFi";
+    } else if ((xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) != 0) {
+        current_conn = "GSM";
+    }
+    
     // Response buffer
-    char response[4500];
+    char response[5000];
     snprintf(response, sizeof(response), config_html,
              mac_string,
              device_mode,
              wifi_class, wifi_status,
+             gsm_class, gsm_status,
              mqtt_class, mqtt_status,
              ip_address,
+             current_conn,
+             g_config.wifi_ssid,
+             g_config.mqtt_broker_url,
              g_config.wifi_ssid,
              g_config.wifi_password,
              g_config.mqtt_broker_url,
+             mac_string,
              zone_inputs,
              g_config.publish_interval_ms,
-             AP_SSID, AP_PASSWORD, hotspot_ip);
+             AP_SSID, AP_PASSWORD, hotspot_ip,
+             mac_string, mac_string);
     
     ESP_LOGI(TAG, "Sending HTML response (%d bytes)", strlen(response));
     httpd_resp_send(req, response, strlen(response));
@@ -1454,7 +1801,7 @@ static void webserver_task(void *arg)
     }
 }
 
-/* Connectivity Manager Task - MODIFIED for permanent hotspot */
+/* Connectivity Manager Task */
 static void connectivity_manager_task(void *arg)
 {
     esp_modem_dce_t *dce = (esp_modem_dce_t *)arg;
@@ -1537,7 +1884,7 @@ static void mqtt_task(void *arg)
 
     esp_mqtt_client_handle_t mqtt_client = NULL;
     bool mqtt_started           = false;
-    uint32_t last_mqtt_publish  = 0;
+    // uint32_t last_mqtt_publish  = 0;
     uint32_t last_connection_check = 0;
 
     while (1) {
@@ -1597,7 +1944,7 @@ static void mqtt_task(void *arg)
         uint8_t  local_zone_alert[TOTAL_ZONE];
 
         if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if ( (loop_counter >= PACKET_TIMEOUT) | alert_flg ) {
+            if ( (loop_counter >= PACKET_TIMEOUT) || prev_alert_flg != alert_flg ) {
                 should_publish     = true;
                 local_loop_counter = loop_counter;
                 local_alert_flg    = alert_flg;
@@ -1645,7 +1992,7 @@ static void mqtt_task(void *arg)
                     ESP_LOGI(TAG, "Published via %s: %s -> %s", 
                             (current_conn_mode == CONN_MODE_WIFI) ? "WiFi" : "GSM",
                             topic_buff, data_buff);
-                    last_mqtt_publish = esp_timer_get_time() / 1000000;
+                    // last_mqtt_publish = esp_timer_get_time() / 1000000;
                     prev_alert_flg    = local_alert_flg;
                 }
             }
@@ -1658,14 +2005,14 @@ static void mqtt_task(void *arg)
     }
 }
 
-/* app_main - MODIFIED for permanent hotspot */
+/* app_main */
 void app_main(void)
 {
     esp_log_level_set("esp_http_client", ESP_LOG_DEBUG);
     esp_log_level_set("esp_https_ota",   ESP_LOG_DEBUG);
     esp_log_level_set("wifi",            ESP_LOG_WARN);
 
-    // ESP_ERROR_CHECK(nvs_flash_erase());
+    // Initialize NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -1749,7 +2096,7 @@ void app_main(void)
     assert(dce);
 
     // Clear all event bits
-    xEventGroupClearBits(event_group, WIFI_CONNECTED_BIT | GSM_CONNECTED_BIT | MQTT_CONNECTED_BIT | OTA_TRIGGER_BIT);
+    xEventGroupClearBits(event_group, WIFI_CONNECTED_BIT | GSM_CONNECTED_BIT | MQTT_CONNECTED_BIT | OTA_TRIGGER_BIT | RECONFIG_TRIGGER_BIT);
 
     // Test GSM modem communication
     ESP_LOGI(TAG, "Testing basic GSM modem communication...");
@@ -1792,19 +2139,19 @@ void app_main(void)
     BaseType_t xRet;
 
     // Start web server task
-    xRet = xTaskCreate(webserver_task, "webserver_task", 8192, NULL, 4, &webserver_task_handle);
+    xRet = xTaskCreate(webserver_task, "webserver_task", 12288, NULL, 4, &webserver_task_handle);
     if (xRet != pdPASS) {
         ESP_LOGE(TAG, "Failed to create webserver task");
     }
 
     // Start WiFi connection task
-    xRet = xTaskCreate(wifi_connection_task, "wifi_conn_task", 8192, NULL, 4, &wifi_task_handle);
+    xRet = xTaskCreate(wifi_connection_task, "wifi_conn_task", 12288, NULL, 4, &wifi_task_handle);
     if (xRet != pdPASS) {
         ESP_LOGE(TAG, "Failed to create WiFi connection task");
     }
 
     // Start connectivity manager
-    xRet = xTaskCreate(connectivity_manager_task, "conn_mgr", 4096, dce, 4, NULL);
+    xRet = xTaskCreate(connectivity_manager_task, "conn_mgr", 8192, dce, 4, NULL);
     if (xRet != pdPASS) {
         ESP_LOGE(TAG, "Failed to create connectivity manager task");
     }
@@ -1812,22 +2159,23 @@ void app_main(void)
     // Start other tasks with delay to allow connectivity to establish
     vTaskDelay(pdMS_TO_TICKS(2000));
 
-    xRet = xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 4, NULL);
+    xRet = xTaskCreate(sensor_task, "sensor_task", 8192, NULL, 4, NULL);
     if (xRet != pdPASS) {
         ESP_LOGE(TAG, "Failed to create sensor task");
     }
 
-    xRet = xTaskCreate(mqtt_task, "mqtt_task", 8192, dce, 5, NULL);
+    xRet = xTaskCreate(mqtt_task, "mqtt_task", 12288, dce, 5, NULL);
     if (xRet != pdPASS) {
         ESP_LOGE(TAG, "Failed to create MQTT task");
     }
 
-    xRet = xTaskCreate(ota_task, "ota_task", 8192, NULL, 5, NULL);
+    xRet = xTaskCreate(ota_task, "ota_task", 12288, NULL, 5, NULL);
     if (xRet != pdPASS) {
         ESP_LOGE(TAG, "Failed to create OTA task");
     }
 
-    ESP_LOGI(TAG, "System fully started with PERMANENT hotspot functionality");
+    ESP_LOGI(TAG, "System fully started with MQTT configuration support");
     ESP_LOGI(TAG, "Hotspot is ALWAYS active at SSID: %s, Password: %s", AP_SSID, AP_PASSWORD);
     ESP_LOGI(TAG, "Connect to hotspot anytime at: http://192.168.4.1 to configure device");
+    ESP_LOGI(TAG, "Configuration can also be updated via MQTT topic: /ZIGRON/%s/CONFIG", mac_string);
 }
