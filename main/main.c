@@ -40,8 +40,8 @@
 #include "esp_wifi.h"
 #include "esp_wifi_default.h"
 
-#define PACKET_TIMEOUT      30          // 30 seconds
-#define FW_VER              "0.05"      // Updated version with MQTT config
+#define PACKET_TIMEOUT      300          // 30 seconds
+#define FW_VER              "0.06"      // Updated version with MQTT config
 #define EXAMPLE_FLOW_CONTROL ESP_MODEM_FLOW_CONTROL_NONE
 #define WIFI_CONNECT_TIMEOUT_MS 30000   // 30 seconds WiFi timeout
 #define MAX_WIFI_RETRIES   3
@@ -673,12 +673,12 @@ static void sensor_task(void *arg)
                 zone_raw_value[4], zone_raw_value[5], zone_raw_value[6], zone_raw_value[7],
                 zone_raw_value[8], zone_raw_value[9]);
 
-            ESP_LOGI(TAG, "Sensor data: %s, Alert flags: 0x%03X", data_buff, alert_flg);
+            // ESP_LOGI(TAG, "Sensor data: %s, Alert flags: 0x%03X", data_buff, alert_flg);
 
             xSemaphoreGive(data_mutex);
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1000));  // sensor period ~1s
+        vTaskDelay(pdMS_TO_TICKS(100));  // sensor period ~1s
     }
 }
 
@@ -871,7 +871,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     zone_alert_state[i] = 0;
                 }
                 alert_flg   = 0;
-                loop_counter = PACKET_TIMEOUT - 1;
+                // loop_counter = PACKET_TIMEOUT - 1;
                 xSemaphoreGive(data_mutex);
             }
         }
@@ -882,7 +882,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 zone_alert_state[i] = 0;
             }
             alert_flg   = 0;
-            loop_counter = PACKET_TIMEOUT - 1;
+            // loop_counter = PACKET_TIMEOUT - 1;
             xSemaphoreGive(data_mutex);
         }
 
@@ -923,11 +923,11 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 // Publish current configuration
                 char config_json[1024];
                 snprintf(config_json, sizeof(config_json),
-                    "{\"wifi_ssid\":\"%s\","
-                    "\"wifi_password\":\"%s\","
-                    "\"mqtt_broker\":\"%s\","
-                    "\"publish_interval\":%lu,"
-                    "\"thresholds\":[",
+                    "{\"ssid\":\"%s\","
+                    "\"pass\":\"%s\","
+                    "\"broker\":\"%s\","
+                    "\"intrvl\":%lu,"
+                    "\"thresh\":[",
                     g_config.wifi_ssid,
                     g_config.wifi_password,
                     g_config.mqtt_broker_url,
@@ -939,7 +939,7 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 for (int i = 0; i < TOTAL_ZONE; i++) {
                     char zone_str[64];
                     snprintf(zone_str, sizeof(zone_str), 
-                        "{\"zone\":%d,\"low\":%d,\"high\":%d}%s",
+                        "{\"z\":%d,\"l\":%d,\"h\":%d}%s",
                         i, g_config.zone_lower[i], g_config.zone_upper[i],
                         (i < TOTAL_ZONE - 1) ? "," : "");
                     strcat(thresholds_str, zone_str);
@@ -2086,7 +2086,7 @@ void app_main(void)
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 1); 
     vTaskDelay(pdMS_TO_TICKS(100));
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 0);
-    gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, 0);
+    gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Initialize GSM modem
