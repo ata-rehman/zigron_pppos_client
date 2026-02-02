@@ -41,7 +41,7 @@
 #include "esp_wifi_default.h"
 
 #define PACKET_TIMEOUT      300          // 30 seconds
-#define FW_VER              "0.06"      // Updated version with MQTT config
+#define FW_VER              "0.07"      // Updated version with MQTT config
 #define EXAMPLE_FLOW_CONTROL ESP_MODEM_FLOW_CONTROL_NONE
 #define WIFI_CONNECT_TIMEOUT_MS 30000   // 30 seconds WiFi timeout
 #define MAX_WIFI_RETRIES   3
@@ -74,6 +74,8 @@ typedef enum {
 
 static conn_mode_t current_conn_mode = CONN_MODE_NONE;
 
+static bool sim_select_flag = 1;
+
 /* Shared data */
 MCP_t   dev;
 uint8_t mac_addr[6] = {0};
@@ -85,8 +87,8 @@ char topic_buff[255];
 static uint8_t  zone_alert_state[TOTAL_ZONE];
 static uint16_t zone_raw_value[TOTAL_ZONE];
 
-static uint16_t zone_lower_limit[TOTAL_ZONE] = {0,0,0,0,0,0,0,0,0,0};
-static uint16_t zone_upper_limit[TOTAL_ZONE] = {900,900,900,900,900,900,900,900,0,0};
+static uint16_t zone_lower_limit[TOTAL_ZONE] = {300,300,300,300,300,300,300,300,300,300};
+static uint16_t zone_upper_limit[TOTAL_ZONE] = {700,700,700,700,700,700,700,700,0,0};
 
 static uint16_t alert_flg       = 0;
 static uint16_t prev_alert_flg  = 0;
@@ -97,6 +99,8 @@ static int      ppp_fail_count  = 0;
 
 /* WiFi connection attempts */
 static int      wifi_retry_count = 0;
+
+uint8_t ota_state = 0;  
 
 /* Protect shared sensor + alert data between tasks & MQTT callback */
 static SemaphoreHandle_t data_mutex = NULL;
@@ -115,8 +119,8 @@ typedef struct {
 
 // Default configuration
 static device_config_t g_config = {
-    .wifi_ssid = "",
-    .wifi_password = "",
+    .wifi_ssid = "Piffers Control Room",
+    .wifi_password = "Pak@12345",
     .mqtt_broker_url = "mqtt://zigron:zigron123@54.194.219.149:45055",
     .publish_interval_ms = 5000,
     .enable_ota = true,
@@ -129,6 +133,9 @@ static bool ap_mode_active = true;
 // Task handles
 static TaskHandle_t wifi_task_handle = NULL;
 static TaskHandle_t webserver_task_handle = NULL;
+
+esp_mqtt_client_handle_t mqtt_client = NULL;
+bool mqtt_started           = false;
 
 /* Forward declarations */
 static void init_wifi(void);
@@ -253,7 +260,7 @@ static void apply_wifi_configuration(void)
 /* Handle MQTT configuration command */
 static void handle_mqtt_config_command(const char *payload, int payload_len)
 {
-    char payload_copy[256];
+    char payload_copy[1024];
     if (payload_len >= sizeof(payload_copy)) {
         ESP_LOGE(TAG, "MQTT config payload too large");
         return;
@@ -328,9 +335,11 @@ static void handle_mqtt_config_command(const char *payload, int payload_len)
             for (int i = 0; i < TOTAL_ZONE && i < array_size; i++) {
                 cJSON *threshold = cJSON_GetArrayItem(thresholds, i);
                 if (cJSON_IsObject(threshold)) {
-                    cJSON *low = cJSON_GetObjectItem(threshold, "low");
-                    cJSON *high = cJSON_GetObjectItem(threshold, "high");
-                    
+                    cJSON *low = cJSON_GetObjectItem(threshold, "l");
+                    cJSON *high = cJSON_GetObjectItem(threshold, "h");
+                    ESP_LOGI(TAG, "MQTT: Zone %d thresholds received: low=%d, high=%d (current low=%d, high=%d)", 
+                             i, low->valueint, high->valueint, g_config.zone_lower[i], g_config.zone_upper[i]);
+
                     if (cJSON_IsNumber(low) && cJSON_IsNumber(high)) {
                         uint16_t new_low = low->valueint;
                         uint16_t new_high = high->valueint;
@@ -635,14 +644,23 @@ static void sensor_task(void *arg)
             /* Buzzer status vs stored zone value */
             if (zone_raw_value[TOTAL_ZONE-2] != gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_BUZZER_STATUS_PIN)) {
                 alert_flg |= 0x0100;
-                zone_alert_state[TOTAL_ZONE-2] = 0x01;
+                zone_alert_state[TOTAL_ZONE-2] |= 0x01;
             } else {
                 alert_flg &= ~0x0100;
-                zone_alert_state[TOTAL_ZONE-2] = 0x00;  // Clear if no longer different
+                zone_alert_state[TOTAL_ZONE-2] &= ~0x01;  // Clear if no longer different
+            }
+
+            /* ARM/DisARM status vs stored zone value */
+            if (zone_raw_value[TOTAL_ZONE-1] != gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_ARM_STATUS_PIN)) {
+                alert_flg |= 0x0200;
+                zone_alert_state[TOTAL_ZONE-1] |= 0x01;
+            } else {
+                alert_flg &= ~0x0200;
+                zone_alert_state[TOTAL_ZONE-1] &= ~0x01;  // Clear if no longer different
             }
 
             /* Digital inputs */
-            zone_raw_value[TOTAL_ZONE-1] = gpio_get_level((gpio_num_t)39);
+            zone_raw_value[TOTAL_ZONE-1] = gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_ARM_STATUS_PIN);
             zone_raw_value[TOTAL_ZONE-2] = gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_BUZZER_STATUS_PIN);
 
             /* Analog zones */
@@ -652,14 +670,14 @@ static void sensor_task(void *arg)
                 uint16_t bitmask = 1 << i;
                 
                 // First, clear any existing alert state for this zone
-                zone_alert_state[i] = 0x00;
+                // zone_alert_state[i] = 0x00;
                 
                 // Then check if we need to set an alert
                 if (zone_raw_value[i] < zone_lower_limit[i]) {
-                    zone_alert_state[i] = 0x01;  // Low alert
+                    zone_alert_state[i] |= 0x01;  // Low alert
                     alert_flg |= bitmask;
                 } else if (zone_raw_value[i] > zone_upper_limit[i]) {
-                    zone_alert_state[i] = 0x02;  // High alert
+                    zone_alert_state[i] |= 0x02;  // High alert
                     alert_flg |= bitmask;
                 } else {
                     // Value is within range, clear the alert flag
@@ -667,14 +685,46 @@ static void sensor_task(void *arg)
                 }
             }
 
-            snprintf(data_buff, sizeof(data_buff),
-                "{\"RAW\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d]}",
+            
+            if( ((loop_counter >= PACKET_TIMEOUT) || (prev_alert_flg != alert_flg)) ) {
+                topic_buff[0] = 0;
+                snprintf(data_buff, sizeof(data_buff),
+                "{\"RAW\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
+                "\"ALERT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
+                "\"DNA\":[\"%s\",%lld],"
+                "\"CONN\":\"%s\","
+                "\"FW\":\"%s\","
+                "\"OTA_STATE\":%d}",
                 zone_raw_value[0], zone_raw_value[1], zone_raw_value[2], zone_raw_value[3],
                 zone_raw_value[4], zone_raw_value[5], zone_raw_value[6], zone_raw_value[7],
-                zone_raw_value[8], zone_raw_value[9]);
+                zone_raw_value[8], zone_raw_value[9],
+                zone_alert_state[0], zone_alert_state[1], zone_alert_state[2], zone_alert_state[3],
+                zone_alert_state[4], zone_alert_state[5], zone_alert_state[6], zone_alert_state[7],
+                zone_alert_state[8], zone_alert_state[9],
+                mac_string, (long long)(esp_timer_get_time() / 1000000),
+                (current_conn_mode == CONN_MODE_WIFI) ? "WIFI" : "GSM",
+                FW_VER, ota_state);
 
-            // ESP_LOGI(TAG, "Sensor data: %s, Alert flags: 0x%03X", data_buff, alert_flg);
+                if(loop_counter >= PACKET_TIMEOUT) 
+                {
+                    snprintf(topic_buff, sizeof(topic_buff), "/ZIGRON/%s/HB", mac_string);
+                }
+                else
+                {
+                    snprintf(topic_buff, sizeof(topic_buff), "/ZIGRON/%s/ALERT", mac_string);
+                }
 
+                if( (mqtt_client) && (mqtt_started) )
+                {
+                    int publish_response = esp_mqtt_client_publish(mqtt_client, topic_buff,
+                                                               data_buff, 0, 0, 0);
+                }
+               
+                ESP_LOGI(TAG, "%s TOPIC %s, Alert flags:0x%03X 0x%03X, LC: %d", topic_buff, data_buff, alert_flg, prev_alert_flg, loop_counter);
+                
+                loop_counter = 0;
+                prev_alert_flg = alert_flg;
+            }
             xSemaphoreGive(data_mutex);
         }
 
@@ -710,17 +760,24 @@ static void perform_modem_reset(esp_modem_dce_t *dce)
 {
     ESP_LOGI(TAG, "Performing complete GSM modem reset...");
 
+    if(sim_select_flag == 0)sim_select_flag = 1;
+    else sim_select_flag = 0;
+
+    ESP_LOGI(TAG, "SIM flag %X",sim_select_flag);
+    gpio_set_level( (gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, sim_select_flag);vTaskDelay(10); //high for A and LOW for Sim B
+
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(1000));
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 0);
 
     ESP_LOGI(TAG, "Waiting for GSM modem to fully reboot (35 seconds)...");
-    vTaskDelay(pdMS_TO_TICKS(35000));
+    vTaskDelay(pdMS_TO_TICKS(15000));
 }
 
 static bool restart_ppp_connection(esp_modem_dce_t *dce)
 {
     ESP_LOGI(TAG, "Attempting to restart GSM PPP connection...");
+    perform_modem_reset(dce);
 
     esp_err_t err = esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
     if (err != ESP_OK) {
@@ -771,7 +828,7 @@ static void check_ppp_connection(esp_modem_dce_t *dce, esp_mqtt_client_handle_t 
 
             if (ppp_fail_count >= 2) {
                 ESP_LOGE(TAG, "Multiple GSM PPP failures, performing modem reset.");
-                perform_modem_reset(dce);
+                // perform_modem_reset(dce);
                 ppp_fail_count = 0;
             } else {
                 if (restart_ppp_connection(dce)) {
@@ -1076,6 +1133,7 @@ static void ota_task(void *arg)
                 (current_conn_mode == CONN_MODE_WIFI) ? "WiFi" : "GSM");
         ESP_LOGI(TAG, "Free heap before OTA: %ld", esp_get_free_heap_size());
         vTaskDelay(pdMS_TO_TICKS(500));
+        ota_state = 1;    
 
         esp_err_t ret = esp_https_ota(&ota_config);
         if (ret == ESP_OK) {
@@ -1084,6 +1142,7 @@ static void ota_task(void *arg)
             esp_restart();
         } else {
             ESP_LOGE(TAG, "OTA failed with error: %s", esp_err_to_name(ret));
+            ota_state = 2; 
             /* Stay alive and wait for next trigger */
         }
     }
@@ -1821,7 +1880,7 @@ static void connectivity_manager_task(void *arg)
                 // Check if enough time has passed since last GSM attempt
                 if (current_time - last_gsm_activation_attempt > 60) { // Wait 60 seconds between attempts
                     ESP_LOGI(TAG, "No WiFi connection - activating GSM PPP connection");
-                    
+
                     // Switch GSM modem to data mode
                     esp_err_t ret = esp_modem_set_mode(dce, ESP_MODEM_MODE_DATA);
                     if (ret == ESP_OK) {
@@ -1845,9 +1904,15 @@ static void connectivity_manager_task(void *arg)
                             ESP_LOGW(TAG, "GSM PPP connection timeout");
                             gsm_activated = false;
                             esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+                            if (restart_ppp_connection(dce)) {
+                                vTaskDelay(pdMS_TO_TICKS(30000));
+                            }
                         }
                     } else {
                         ESP_LOGE(TAG, "Failed to activate GSM data mode: %s", esp_err_to_name(ret));
+                        if (restart_ppp_connection(dce)) {
+                            vTaskDelay(pdMS_TO_TICKS(30000));
+                        }
                     }
                     last_gsm_activation_attempt = current_time;
                 }
@@ -1882,8 +1947,8 @@ static void mqtt_task(void *arg)
     esp_modem_dce_t *dce = (esp_modem_dce_t *)arg;
     ESP_LOGI(TAG, "MQTT task started");
 
-    esp_mqtt_client_handle_t mqtt_client = NULL;
-    bool mqtt_started           = false;
+    // esp_mqtt_client_handle_t mqtt_client = NULL;
+    // bool mqtt_started           = false;
     // uint32_t last_mqtt_publish  = 0;
     uint32_t last_connection_check = 0;
 
@@ -1933,68 +1998,6 @@ static void mqtt_task(void *arg)
                 ESP_LOGE(TAG, "Failed to start MQTT client");
                 vTaskDelay(pdMS_TO_TICKS(10000));
                 continue;
-            }
-        }
-
-        /* Publish every PACKET_TIMEOUT ticks from sensor_task */
-        bool     should_publish = false;
-        uint16_t local_loop_counter;
-        uint16_t local_alert_flg;
-        uint16_t local_zone_raw[TOTAL_ZONE];
-        uint8_t  local_zone_alert[TOTAL_ZONE];
-
-        if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if ( (loop_counter >= PACKET_TIMEOUT) || prev_alert_flg != alert_flg ) {
-                should_publish     = true;
-                local_loop_counter = loop_counter;
-                local_alert_flg    = alert_flg;
-                memcpy(local_zone_raw,   zone_raw_value,   sizeof(local_zone_raw));
-                memcpy(local_zone_alert, zone_alert_state, sizeof(local_zone_alert));
-                loop_counter = 0;
-                ESP_LOGI(TAG, "SHOULD PUBLISH triggered at loop_counter= %d, alert_flg=%d", 
-                        local_loop_counter, alert_flg);
-            }
-            xSemaphoreGive(data_mutex);
-        }
-
-        if (should_publish && mqtt_started && network_connected) {
-            data_buff[0]  = 0;
-            topic_buff[0] = 0;
-
-            int data_len = snprintf(data_buff, sizeof(data_buff),
-                "{\"RAW\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
-                "\"ALERT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
-                "\"DNA\":[\"%s\",%lld],"
-                "\"CONN\":\"%s\","
-                "\"FW\":\"%s\"}",
-                local_zone_raw[0], local_zone_raw[1], local_zone_raw[2], local_zone_raw[3],
-                local_zone_raw[4], local_zone_raw[5], local_zone_raw[6], local_zone_raw[7],
-                local_zone_raw[8], local_zone_raw[9],
-                local_zone_alert[0], local_zone_alert[1], local_zone_alert[2], local_zone_alert[3],
-                local_zone_alert[4], local_zone_alert[5], local_zone_alert[6], local_zone_alert[7],
-                local_zone_alert[8], local_zone_alert[9],
-                mac_string, (long long)(esp_timer_get_time() / 1000000),
-                (current_conn_mode == CONN_MODE_WIFI) ? "WIFI" : "GSM",
-                FW_VER);
-
-            if (data_len > 0 && data_len < (int)sizeof(data_buff)) {
-                if (prev_alert_flg != local_alert_flg) {
-                    snprintf(topic_buff, sizeof(topic_buff), "/ZIGRON/%s/ALERT", mac_string);
-                } else {
-                    snprintf(topic_buff, sizeof(topic_buff), "/ZIGRON/%s/HB", mac_string);
-                }
-
-                int publish_response = esp_mqtt_client_publish(mqtt_client, topic_buff,
-                                                               data_buff, 0, 0, 0);
-                if (publish_response == -1) {
-                    ESP_LOGE(TAG, "MQTT publish failed");
-                } else {
-                    ESP_LOGI(TAG, "Published via %s: %s -> %s", 
-                            (current_conn_mode == CONN_MODE_WIFI) ? "WiFi" : "GSM",
-                            topic_buff, data_buff);
-                    // last_mqtt_publish = esp_timer_get_time() / 1000000;
-                    prev_alert_flg    = local_alert_flg;
-                }
             }
         }
 
@@ -2080,13 +2083,13 @@ void app_main(void)
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN,  GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN,   GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_BUZZER_STATUS_PIN, GPIO_MODE_INPUT);
-    gpio_set_direction((gpio_num_t)39, GPIO_MODE_INPUT); // Digital input pin
+    gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_ARM_STATUS_PIN, GPIO_MODE_INPUT); // Digital input pin
 
     // Reset modem
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 1); 
     vTaskDelay(pdMS_TO_TICKS(100));
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 0);
-    gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, 1);
+    gpio_set_level( (gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, sim_select_flag);
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // Initialize GSM modem

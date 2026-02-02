@@ -248,4 +248,11 @@ menu "Example Configuration"
         help
             Pin number of BUZZER_STATUS_PIN.
 
+    config EXAMPLE_ARM_STATUS_PIN
+        int "ARM/DISARM Pin Number"
+        default 39
+        range 0 56
+        help
+            Pin number of ARM_STATUS_PIN.        
+
 endmenu
