@@ -41,7 +41,7 @@
 #include "esp_wifi_default.h"
 
 #define PACKET_TIMEOUT      300          // 30 seconds
-#define FW_VER              "0.07"      // Updated version with MQTT config
+#define FW_VER              "0.08"      // Updated version with MQTT config
 #define EXAMPLE_FLOW_CONTROL ESP_MODEM_FLOW_CONTROL_NONE
 #define WIFI_CONNECT_TIMEOUT_MS 30000   // 30 seconds WiFi timeout
 #define MAX_WIFI_RETRIES   3
@@ -87,8 +87,8 @@ char topic_buff[255];
 static uint8_t  zone_alert_state[TOTAL_ZONE];
 static uint16_t zone_raw_value[TOTAL_ZONE];
 
-static uint16_t zone_lower_limit[TOTAL_ZONE] = {300,300,300,300,300,300,300,300,300,300};
-static uint16_t zone_upper_limit[TOTAL_ZONE] = {700,700,700,700,700,700,700,700,0,0};
+static uint16_t zone_lower_limit[TOTAL_ZONE] = {0,0,0,0,0,0,0,0,0,0};
+static uint16_t zone_upper_limit[TOTAL_ZONE] = {2000,2000,2000,2000,2000,2000,2000,2000,0,0};
 
 static uint16_t alert_flg       = 0;
 static uint16_t prev_alert_flg  = 0;
@@ -350,11 +350,11 @@ static void handle_mqtt_config_command(const char *payload, int payload_len)
                             config_changed = true;
                             
                             // Update runtime thresholds
-                            if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+                            // if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
                                 zone_lower_limit[i] = new_low;
                                 zone_upper_limit[i] = new_high;
-                                xSemaphoreGive(data_mutex);
-                            }
+                                // xSemaphoreGive(data_mutex);
+                            // }
                             
                             ESP_LOGI(TAG, "MQTT: Zone %d thresholds: low=%d, high=%d", i, new_low, new_high);
                         }
@@ -684,7 +684,7 @@ static void sensor_task(void *arg)
                     alert_flg &= ~bitmask;
                 }
             }
-
+            xSemaphoreGive(data_mutex);
             
             if( ((loop_counter >= PACKET_TIMEOUT) || (prev_alert_flg != alert_flg)) ) {
                 topic_buff[0] = 0;
@@ -725,9 +725,8 @@ static void sensor_task(void *arg)
                 loop_counter = 0;
                 prev_alert_flg = alert_flg;
             }
-            xSemaphoreGive(data_mutex);
         }
-
+        
         vTaskDelay(pdMS_TO_TICKS(100));  // sensor period ~1s
     }
 }
