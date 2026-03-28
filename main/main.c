@@ -39,9 +39,12 @@
 // WiFi headers for ESP-IDF v5.5.1
 #include "esp_wifi.h"
 #include "esp_wifi_default.h"
+#include "esp_sntp.h"
+#include <time.h>
+#include <sys/time.h>
 
 #define PACKET_TIMEOUT      300          // 30 seconds
-#define FW_VER              "0.09"      // Updated version with fixes
+#define FW_VER              "0.10"      // Updated version with fixes
 #define EXAMPLE_FLOW_CONTROL ESP_MODEM_FLOW_CONTROL_NONE
 #define WIFI_CONNECT_TIMEOUT_MS 30000   // 30 seconds WiFi timeout
 #define MAX_WIFI_RETRIES   3
@@ -617,6 +620,31 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
             }
             
             xEventGroupSetBits(event_group, WIFI_CONNECTED_BIT);
+            
+            // Initialize SNTP for WiFi connection
+            esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+            esp_sntp_setservername(0, "pool.ntp.org");
+            esp_sntp_setservername(1, "time.google.com");
+            esp_sntp_init();
+            
+            // Wait for time synchronization
+            time_t now = 0;
+            struct tm timeinfo = {0};
+            int retry = 0;
+            
+            while (timeinfo.tm_year < (2020 - 1900) && ++retry < 10) {
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                time(&now);
+                localtime_r(&now, &timeinfo);
+            }
+            
+            if (timeinfo.tm_year > (2020 - 1900)) {
+                char strftime_buf[64];
+                strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+                ESP_LOGI(TAG, "Time synchronized via WiFi: %s", strftime_buf);
+            } else {
+                ESP_LOGW(TAG, "Time synchronization via WiFi failed");
+            }
         }
     }
 }
@@ -759,12 +787,14 @@ static void sensor_task(void *arg)
                 } else {
                     // Value is within range, clear the alert flag
                     alert_flg &= ~bitmask;
-                    zone_alert_state[i] = 0;  // Clear alert state
+                    // zone_alert_state[i] = 0;  // Clear alert state
                 }
             }
             xSemaphoreGive(data_mutex);
             
             if( ((loop_counter >= PACKET_TIMEOUT) || (prev_alert_flg != alert_flg)) ) {
+                time_t now;
+                time(&now);
                 topic_buff[0] = 0;
                 snprintf(data_buff, sizeof(data_buff),
                 "{\"RAW\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
@@ -779,7 +809,7 @@ static void sensor_task(void *arg)
                 zone_alert_state[0], zone_alert_state[1], zone_alert_state[2], zone_alert_state[3],
                 zone_alert_state[4], zone_alert_state[5], zone_alert_state[6], zone_alert_state[7],
                 zone_alert_state[8], zone_alert_state[9],
-                mac_string, (long long)(esp_timer_get_time() / 1000000),
+                mac_string, (long long)now,
                 (current_conn_mode == CONN_MODE_WIFI) ? "WIFI" : "GSM",sim_select_flag,
                 FW_VER, ota_state);
 
@@ -1026,7 +1056,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     zone_alert_state[i] = 0;
                 }
                 alert_flg   = 0;
-                loop_counter = PACKET_TIMEOUT - 1;
                 xSemaphoreGive(data_mutex);
                 ESP_LOGI(TAG, "Alerts cleared via MQTT CLEAR");
             }
@@ -1131,6 +1160,31 @@ static void on_ip_event(void *arg, esp_event_base_t event_base,
         esp_netif_dns_info_t dns_info;
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         esp_netif_t *netif = event->esp_netif;
+
+        // Initialize SNTP for ESP-IDF v5.5.1
+        esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_init();
+
+        time_t now = 0;
+        struct tm timeinfo = {0};
+        int retry = 0;
+
+        // Wait for time to be set
+        while (timeinfo.tm_year < (2020 - 1900) && ++retry < 10) {
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            time(&now);
+            localtime_r(&now, &timeinfo);
+        }
+        
+        // Log time synchronization status
+        if (timeinfo.tm_year > (2020 - 1900)) {
+            char strftime_buf[64];
+            strftime(strftime_buf, sizeof(strftime_buf), "%c", &timeinfo);
+            ESP_LOGI(TAG, "Time synchronized: %s", strftime_buf);
+        } else {
+            ESP_LOGW(TAG, "Time synchronization failed or took too long");
+        }
 
         ESP_LOGI(TAG, "GSM Modem connected to PPP server");
         ESP_LOGI(TAG, "~~~~~~~~~~~~~~");
