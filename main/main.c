@@ -44,7 +44,7 @@
 #include <sys/time.h>
 
 #define PACKET_TIMEOUT      300          // 30 seconds
-#define FW_VER              "0.10"      // Updated version with fixes
+#define FW_VER              "0.11"      // Updated version with fixes
 #define EXAMPLE_FLOW_CONTROL ESP_MODEM_FLOW_CONTROL_NONE
 #define WIFI_CONNECT_TIMEOUT_MS 30000   // 30 seconds WiFi timeout
 #define MAX_WIFI_RETRIES   3
@@ -768,8 +768,14 @@ static void sensor_task(void *arg)
             }
 
             /* Digital inputs */
-            zone_raw_value[TOTAL_ZONE-1] = gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_ARM_STATUS_PIN);
-            zone_raw_value[TOTAL_ZONE-2] = gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_BUZZER_STATUS_PIN);
+            for (uint8_t i = 0; i < 20; i++) {
+                zone_raw_value[TOTAL_ZONE-1] += gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_ARM_STATUS_PIN);
+                zone_raw_value[TOTAL_ZONE-2] = gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_BUZZER_STATUS_PIN);
+            }
+            if(zone_raw_value[TOTAL_ZONE-1] > 18) zone_raw_value[TOTAL_ZONE-1] = 1;  // Cap at max possible value
+            else zone_raw_value[TOTAL_ZONE-1] = 0;
+            if(zone_raw_value[TOTAL_ZONE-2] > 18) zone_raw_value[TOTAL_ZONE-2] = 1;  // Cap at max possible value
+            else zone_raw_value[TOTAL_ZONE-2] = 0;
 
             /* Analog zones */
             for (uint8_t i = 0; i < (TOTAL_ZONE-2); i++) {
@@ -800,18 +806,20 @@ static void sensor_task(void *arg)
                 "{\"RAW\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
                 "\"ALERT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
                 "\"DNA\":[\"%s\",%lld],"
+                "\"TS\":\"%lld\","
                 "\"CONN\":\"%s%d\","
                 "\"FW\":\"%s\","
-                "\"OTA_STATE\":%d}",
+                "\"OTA_STATE\":%d}%c",
                 zone_raw_value[0], zone_raw_value[1], zone_raw_value[2], zone_raw_value[3],
                 zone_raw_value[4], zone_raw_value[5], zone_raw_value[6], zone_raw_value[7],
                 zone_raw_value[8], zone_raw_value[9],
                 zone_alert_state[0], zone_alert_state[1], zone_alert_state[2], zone_alert_state[3],
                 zone_alert_state[4], zone_alert_state[5], zone_alert_state[6], zone_alert_state[7],
                 zone_alert_state[8], zone_alert_state[9],
-                mac_string, (long long)now,
+                mac_string, (long long)(esp_timer_get_time() / 1000000),
+                (long long)now,
                 (current_conn_mode == CONN_MODE_WIFI) ? "WIFI" : "GSM",sim_select_flag,
-                FW_VER, ota_state);
+                FW_VER, ota_state,0);
 
                 if(loop_counter >= PACKET_TIMEOUT) 
                 {
@@ -826,6 +834,7 @@ static void sensor_task(void *arg)
                 {
                     int publish_response = esp_mqtt_client_publish(mqtt_client, topic_buff,
                                                                data_buff, 0, 0, 0);
+                    vTaskDelay(pdMS_TO_TICKS(5000));  // sensor period ~1s
                     if (publish_response < 0) {
                         ESP_LOGW(TAG, "MQTT publish failed: %d", publish_response);
                     }
