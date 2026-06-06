@@ -44,7 +44,7 @@
 #include <sys/time.h>
 
 #define PACKET_TIMEOUT      300          // 30 seconds
-#define FW_VER              "0.11"      // Updated version with fixes
+#define FW_VER              "0.1259a"     // Updated version with fixes
 #define EXAMPLE_FLOW_CONTROL ESP_MODEM_FLOW_CONTROL_NONE
 #define WIFI_CONNECT_TIMEOUT_MS 30000   // 30 seconds WiFi timeout
 #define MAX_WIFI_RETRIES   3
@@ -101,8 +101,11 @@ char topic_buff[128];
 static uint8_t  zone_alert_state[TOTAL_ZONE];
 static uint16_t zone_raw_value[TOTAL_ZONE];
 
-static uint16_t zone_lower_limit[TOTAL_ZONE] = {0,0,0,0,0,0,0,0,0,0};
-static uint16_t zone_upper_limit[TOTAL_ZONE] = {2000,2000,2000,2000,2000,2000,2000,2000,0,0};
+// static uint16_t zone_lower_limit[TOTAL_ZONE] = {300,300,300,300,300,300,300,300,0,0};
+// static uint16_t zone_upper_limit[TOTAL_ZONE] = {700,700,700,700,700,700,700,700,0,0};
+
+static uint16_t zone_lower_limit[TOTAL_ZONE] = {500,500,500,500,500,500,500,500,0,0};
+static uint16_t zone_upper_limit[TOTAL_ZONE] = {900,900,900,900,900,900,900,900,0,0};
 
 static uint16_t alert_flg       = 0;
 static uint16_t prev_alert_flg  = 0;
@@ -779,22 +782,38 @@ static void sensor_task(void *arg)
 
             /* Analog zones */
             for (uint8_t i = 0; i < (TOTAL_ZONE-2); i++) {
-                zone_raw_value[i] = mcpReadData(&dev, i);
-
+                uint8_t temp_low_alert = 0;
+                uint8_t temp_high_alert = 0;
+                uint16_t current_value = 0;
                 uint16_t bitmask = 1 << i;
+
+                for (uint8_t j = 0; j < 5; j++) {
+                    vTaskDelay(pdMS_TO_TICKS(5)); 
+                    current_value = mcpReadData(&dev, i);
+                    // Check if we need to set an alert
+                    if (current_value < zone_lower_limit[i]) {
+                        temp_low_alert += 1;  // Low alert
+                    } 
+                    else if (current_value > zone_upper_limit[i]) {
+                        temp_high_alert += 1;  // High alert
+                    }  
+                }
                 
                 // Check if we need to set an alert
-                if (zone_raw_value[i] < zone_lower_limit[i]) {
+                if (temp_low_alert >= 4) {  // If at least 4 out of 5 readings are low, set low alert
+                    zone_raw_value[i] = current_value;  
                     zone_alert_state[i] |= 0x01;  // Low alert
                     alert_flg |= bitmask;
-                } else if (zone_raw_value[i] > zone_upper_limit[i]) {
+                } else if (temp_high_alert >= 4) {  // If at least 4 out of 5 readings are high, set high alert
+                    zone_raw_value[i] = current_value;
                     zone_alert_state[i] |= 0x02;  // High alert
                     alert_flg |= bitmask;
                 } else {
                     // Value is within range, clear the alert flag
+                    zone_raw_value[i] = current_value; 
                     alert_flg &= ~bitmask;
-                    // zone_alert_state[i] = 0;  // Clear alert state
                 }
+                // ESP_LOGD(TAG, "Sensor read: %d 0x%03X 0x%03X 0x%03X 0x%03X 0x%03X", i, zone_alert_state[i], temp_low_alert, temp_high_alert, current_value, zone_raw_value[i]);
             }
             xSemaphoreGive(data_mutex);
             
