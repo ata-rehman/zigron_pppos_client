@@ -47,9 +47,10 @@
 #include "esp_sleep.h"
 
 // ============= CONFIGURATION =============
+#define SYSTEM_RESET_TIMEOUT    9000         // 900s = 15 minutes in case of no communication system gets reset itself 
 #define PACKET_TIMEOUT          600          // 60 seconds
 #define ALERT_TIMEOUT           50           // 5 seconds
-#define FW_VER                  "0.13"       // Updated version
+#define FW_VER                  "0.13b"       // Updated version
 #define EXAMPLE_FLOW_CONTROL    ESP_MODEM_FLOW_CONTROL_NONE
 
 // Optimized timing parameters
@@ -560,6 +561,7 @@ static void connectivity_manager_task(void *arg)
 static void sensor_task(void *arg)
 {
     ESP_LOGI(TAG, "Sensor task started");
+    static uint16_t comm_timeout_counter = 0;
     static uint16_t alert_flg = 0;
     static uint16_t prev_alert_flg = 0;
     static uint16_t loop_counter = 0;
@@ -572,7 +574,11 @@ static void sensor_task(void *arg)
         if (data_mutex && xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
             loop_counter++;
             alert_counter++;
-            
+            comm_timeout_counter++;
+            if (comm_timeout_counter > SYSTEM_RESET_TIMEOUT) {
+                ESP_LOGW(TAG, "No communication for %d ms, resetting system", SYSTEM_RESET_TIMEOUT * 1000);
+                esp_restart();
+            }        
             // Read analog zones - optimized with direct reads
             for (uint8_t i = 0; i < (TOTAL_ZONE - 2); i++) {
                 zone_raw_value[i] = mcpReadData(&dev, i);
@@ -664,6 +670,7 @@ static void sensor_task(void *arg)
                 if (mqtt_client && mqtt_started) {
                     int pub = esp_mqtt_client_publish(mqtt_client, topic_buff, data_buff, 0, 0, 0);
                     if (pub >= 0) {
+                        comm_timeout_counter = 0;
                         // memset(zone_alert_state, 0, sizeof(zone_alert_state));
                         ESP_LOGI(TAG, "Published to: %s", topic_buff);
                     }
@@ -1075,6 +1082,8 @@ void app_main(void)
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, sim_select_flag);
     vTaskDelay(pdMS_TO_TICKS(100));
     
+    xTaskCreate(sensor_task, "sensor", 6144, NULL, 3, &sensor_task_handle);
+
     // GSM modem
     esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG("internet");
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_PPP();
