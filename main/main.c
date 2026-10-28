@@ -77,6 +77,7 @@ static const int OTA_TRIGGER_BIT      = BIT3;
 static const int RECONFIG_TRIGGER_BIT = BIT4;
 static const int WIFI_RECONNECT_BIT   = BIT5;
 static const int NETWORK_AVAILABLE_BIT = BIT6;  // New: any network available
+static const int MQTT_RECONNECT_BIT   = BIT7;  // New: trigger MQTT reconnection
 
 // ============= STATE MANAGEMENT =============
 typedef enum {
@@ -650,7 +651,7 @@ static void sensor_task(void *arg)
                 ESP_LOGI(TAG, "Alert: 0x%03X", alert_flg);
                 prev_alert_flg = alert_flg;
                 alert_ready = 1;
-                alert_counter = 80;
+                alert_counter = 0;
             }
             
             xSemaphoreGive(data_mutex);
@@ -887,6 +888,16 @@ static void mqtt_task(void *arg)
             }
         }
         
+        if (xEventGroupGetBits(event_group) & MQTT_RECONNECT_BIT) {
+            xEventGroupClearBits(event_group, MQTT_RECONNECT_BIT);
+            if (mqtt_client) {
+                esp_mqtt_client_stop(mqtt_client);
+                esp_mqtt_client_destroy(mqtt_client);
+                mqtt_client = NULL;
+            }
+            mqtt_started = false;
+        }
+        
         // Start MQTT if not started
         if (mqtt_client && !mqtt_started) {
             if (esp_mqtt_client_start(mqtt_client) == ESP_OK) {
@@ -1051,6 +1062,10 @@ static void handle_mqtt_config_command(const char *payload, int payload_len)
             if (strlen(g_config.wifi_ssid) > 0) {
                 xEventGroupSetBits(event_group, WIFI_RECONNECT_BIT);
             }
+            // Trigger MQTT reconnection if broker URL changed
+            if (strlen(g_config.mqtt_broker_url) > 0) {
+                xEventGroupSetBits(event_group, MQTT_RECONNECT_BIT);
+            }
         }
     }
 }
@@ -1187,7 +1202,7 @@ void app_main(void)
     
     // Create tasks with optimized stack sizes
     xTaskCreate(wifi_connection_task, "wifi", 8192, NULL, 4, &wifi_task_handle);
-    xTaskCreate(sensor_task, "sensor", 6144, NULL, 3, &sensor_task_handle);
+    // xTaskCreate(sensor_task, "sensor", 6144, NULL, 3, &sensor_task_handle);
     xTaskCreate(mqtt_task, "mqtt", 8192, dce, 5, &mqtt_task_handle);
     xTaskCreate(ota_task, "ota", 8192, NULL, 5, &ota_task_handle);
     
