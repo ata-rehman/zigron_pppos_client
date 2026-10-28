@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier: Unlicense OR CC0-1.0
  */
-/* Optimized WiFi-first MQTT + OTA with GSM/PPP as backup
+/* Optimized WiFi-first MQTT + OTA with GSM/PPP as backup + BLE configuration
    Fast switching, reduced memory footprint, improved reliability
 */
 
@@ -46,6 +46,15 @@
 #include "esp_pm.h"
 #include "esp_sleep.h"
 
+/* BLE / NimBLE includes */
+#include "esp_nimble_hci.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+
 // ============= CONFIGURATION =============
 #define SYSTEM_RESET_TIMEOUT    9000         // 900s = 15 minutes in case of no communication system gets reset itself 
 #define PACKET_TIMEOUT          600          // 60 seconds
@@ -66,6 +75,12 @@
 #define TOTAL_ZONE                  10
 #define MQTT_PUBLISH_RETRY_INTERVAL 5000    // 5s retry interval
 
+/* BLE configuration */
+#define BLE_DEVICE_NAME             "Zigron_Config"
+#define BLE_SVC_UUID                0xFFE0
+#define BLE_CHAR_UUID               0xFFE1
+#define BLE_CONFIG_MAX_LEN          512
+
 static const char *TAG = "Zigron_Opt";
 
 // ============= EVENT BITS =============
@@ -76,8 +91,8 @@ static const int MQTT_CONNECTED_BIT   = BIT2;
 static const int OTA_TRIGGER_BIT      = BIT3;
 static const int RECONFIG_TRIGGER_BIT = BIT4;
 static const int WIFI_RECONNECT_BIT   = BIT5;
-static const int NETWORK_AVAILABLE_BIT = BIT6;  // New: any network available
-static const int MQTT_RECONNECT_BIT   = BIT7;  // New: trigger MQTT reconnection
+static const int NETWORK_AVAILABLE_BIT = BIT6;
+static const int MQTT_RECONNECT_BIT   = BIT7;
 
 // ============= STATE MANAGEMENT =============
 typedef enum {
@@ -99,6 +114,7 @@ static SemaphoreHandle_t wifi_state_mutex = NULL;
 static SemaphoreHandle_t data_mutex = NULL;
 static SemaphoreHandle_t conn_mutex = NULL;
 static SemaphoreHandle_t ota_mutex = NULL;
+static SemaphoreHandle_t config_mutex = NULL;   /* Protects g_config and zone_* arrays */
 
 static bool sim_select_flag = 1;
 static uint8_t ota_state = 0;
@@ -157,6 +173,11 @@ static TaskHandle_t ota_task_handle = NULL;
 esp_mqtt_client_handle_t mqtt_client = NULL;
 bool mqtt_started = false;
 
+/* BLE state */
+static uint8_t ble_own_addr_type;
+static uint16_t ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+static uint16_t ble_config_val_handle;
+
 // ============= FORWARD DECLARATIONS =============
 static void init_wifi(void);
 static bool connect_wifi_safe(void);
@@ -179,7 +200,15 @@ static bool validate_ota_request(const char *url, const char *version);
 static int compare_firmware_version(const char *new_version, const char *current_version);
 static esp_err_t save_config_to_nvs(void);
 static esp_err_t load_config_from_nvs(void);
-static void handle_snooze_command(const char *payload, int payload_len);
+
+/* BLE forward declarations */
+static void ble_init(void);
+static void ble_advertise(void);
+static int ble_gap_event(struct ble_gap_event *event, void *arg);
+static int ble_config_chr_access(uint16_t conn_handle, uint16_t attr_handle,
+                                 struct ble_gatt_access_ctxt *ctxt, void *arg);
+static void ble_on_sync(void);
+static void ble_on_reset(int reason);
 
 // ============= UTILITY FUNCTIONS =============
 static inline void set_wifi_state(wifi_state_t state) {
@@ -187,15 +216,6 @@ static inline void set_wifi_state(wifi_state_t state) {
         wifi_state = state;
         xSemaphoreGive(wifi_state_mutex);
     }
-}
-
-static inline wifi_state_t get_wifi_state(void) {
-    wifi_state_t state = WIFI_STATE_IDLE;
-    if (xSemaphoreTake(wifi_state_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        state = wifi_state;
-        xSemaphoreGive(wifi_state_mutex);
-    }
-    return state;
 }
 
 // ============= VERSION COMPARISON =============
@@ -235,12 +255,15 @@ static esp_err_t save_config_to_nvs(void)
     esp_err_t err = nvs_open(NVS_CONFIG_NAMESPACE, NVS_READWRITE, &handle);
     if (err != ESP_OK) return err;
 
-    // Copy current snooze state to config
-    memcpy(g_config.zone_snooze, zone_snooze_state, sizeof(zone_snooze_state));
+    if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        memcpy(g_config.zone_snooze, zone_snooze_state, sizeof(zone_snooze_state));
+        err = nvs_set_blob(handle, "config", &g_config, sizeof(g_config));
+        xSemaphoreGive(config_mutex);
+    } else {
+        err = ESP_ERR_TIMEOUT;
+    }
     
-    err = nvs_set_blob(handle, "config", &g_config, sizeof(g_config));
     if (err == ESP_OK) err = nvs_commit(handle);
-    
     nvs_close(handle);
     return err;
 }
@@ -272,7 +295,7 @@ static esp_err_t load_config_from_nvs(void)
     return err;
 }
 
-// ============= WIFI FUNCTIONS (OPTIMIZED) =============
+// ============= WIFI FUNCTIONS =============
 static void init_wifi(void)
 {
     ESP_LOGI(TAG, "Initializing WiFi...");
@@ -291,12 +314,26 @@ static void init_wifi(void)
 
 static bool connect_wifi_safe(void)
 {
-    if (strlen(g_config.wifi_ssid) == 0) {
+    char ssid_copy[32];
+    char pass_copy[64];
+    
+    if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        strncpy(ssid_copy, g_config.wifi_ssid, sizeof(ssid_copy) - 1);
+        ssid_copy[sizeof(ssid_copy) - 1] = '\0';
+        strncpy(pass_copy, g_config.wifi_password, sizeof(pass_copy) - 1);
+        pass_copy[sizeof(pass_copy) - 1] = '\0';
+        xSemaphoreGive(config_mutex);
+    } else {
+        ESP_LOGW(TAG, "Cannot read config");
+        return false;
+    }
+    
+    if (strlen(ssid_copy) == 0) {
         ESP_LOGW(TAG, "WiFi SSID not configured");
         return false;
     }
     
-    ESP_LOGI(TAG, "Connecting to WiFi: %s", g_config.wifi_ssid);
+    ESP_LOGI(TAG, "Connecting to WiFi: %s", ssid_copy);
     set_wifi_state(WIFI_STATE_CONNECTING);
     
     wifi_config_t wifi_config = {
@@ -305,8 +342,8 @@ static bool connect_wifi_safe(void)
             .pmf_cfg = { .capable = true, .required = false },
         },
     };
-    strncpy((char*)wifi_config.sta.ssid, g_config.wifi_ssid, sizeof(wifi_config.sta.ssid) - 1);
-    strncpy((char*)wifi_config.sta.password, g_config.wifi_password, sizeof(wifi_config.sta.password) - 1);
+    strncpy((char*)wifi_config.sta.ssid, ssid_copy, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, pass_copy, sizeof(wifi_config.sta.password) - 1);
     
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -332,7 +369,6 @@ static bool connect_wifi_safe(void)
         return false;
     }
     
-    // Wait for connection with reduced timeout
     EventBits_t bits = xEventGroupWaitBits(event_group, WIFI_CONNECTED_BIT,
                                           pdFALSE, pdFALSE,
                                           pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
@@ -376,7 +412,6 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
         set_wifi_state(WIFI_STATE_CONNECTED);
         xEventGroupSetBits(event_group, WIFI_CONNECTED_BIT | NETWORK_AVAILABLE_BIT);
         
-        // Fast time sync
         esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
         esp_sntp_setservername(0, "pool.ntp.org");
         esp_sntp_init();
@@ -387,12 +422,11 @@ static void ip_event_handler(void* arg, esp_event_base_t event_base,
 static void wifi_connection_task(void *arg)
 {
     ESP_LOGI(TAG, "WiFi connection task started");
-    int retry_delay = 5;  // Start with 5 seconds
+    int retry_delay = 5;
     
     while (1) {
         EventBits_t bits = xEventGroupGetBits(event_group);
         
-        // Handle reconfiguration
         if (bits & RECONFIG_TRIGGER_BIT) {
             xEventGroupClearBits(event_group, RECONFIG_TRIGGER_BIT);
             ESP_LOGI(TAG, "Reconfiguration triggered");
@@ -404,29 +438,18 @@ static void wifi_connection_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(500));
         }
         
-        // Check if already connected
         if (bits & WIFI_CONNECTED_BIT) {
             vTaskDelay(pdMS_TO_TICKS(NETWORK_CHECK_INTERVAL_MS));
             continue;
         }
         
-        // Check SSID configured
-        if (strlen(g_config.wifi_ssid) == 0) {
-            ESP_LOGW(TAG, "WiFi SSID not configured");
-            vTaskDelay(pdMS_TO_TICKS(10000));
-            continue;
-        }
-        
-        // Attempt connection
         if (connect_wifi_safe()) {
-            retry_delay = 5;  // Reset delay on success
+            retry_delay = 5;
         } else {
-            // Exponential backoff with cap
             retry_delay = (retry_delay < 60) ? retry_delay * 2 : 60;
             ESP_LOGI(TAG, "Retry WiFi in %d seconds", retry_delay);
             for (int i = 0; i < retry_delay; i++) {
                 vTaskDelay(pdMS_TO_TICKS(1000));
-                // Check if GSM took over
                 if (xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT) {
                     ESP_LOGI(TAG, "GSM active, pausing WiFi retry");
                     xEventGroupWaitBits(event_group, WIFI_RECONNECT_BIT | RECONFIG_TRIGGER_BIT,
@@ -437,16 +460,16 @@ static void wifi_connection_task(void *arg)
     }
 }
 
-// ============= GSM/PPP FUNCTIONS (OPTIMIZED) =============
+// ============= GSM/PPP FUNCTIONS =============
 static bool check_network_registration(esp_modem_dce_t *dce)
 {
-    int rssi, ber;
-    for (int retry = 0; retry < 5; retry++) {  // Reduced from 10 to 5
+    int rssi = -999, ber = 99;
+    for (int retry = 0; retry < 5; retry++) {
         if (esp_modem_get_signal_quality(dce, &rssi, &ber) == ESP_OK) {
             ESP_LOGI(TAG, "GSM RSSI: %d", rssi);
             if (rssi > MIN_GSM_SIGNAL_THRESHOLD) return true;
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));  // Reduced from 5s to 2s
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
     return false;
 }
@@ -454,15 +477,18 @@ static bool check_network_registration(esp_modem_dce_t *dce)
 static void perform_modem_reset(esp_modem_dce_t *dce)
 {
     ESP_LOGI(TAG, "Modem reset...");
+    esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
     sim_select_flag = !sim_select_flag;
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, sim_select_flag);
     vTaskDelay(pdMS_TO_TICKS(50));
     
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(500));  // Reduced from 1s to 500ms
+    vTaskDelay(pdMS_TO_TICKS(500));
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 0);
     
-    vTaskDelay(pdMS_TO_TICKS(8000));  // Reduced from 15s to 8s
+    vTaskDelay(pdMS_TO_TICKS(8000));
 }
 
 static bool restart_ppp_connection(esp_modem_dce_t *dce)
@@ -473,9 +499,9 @@ static bool restart_ppp_connection(esp_modem_dce_t *dce)
     if (esp_modem_set_mode(dce, ESP_MODEM_MODE_COMMAND) != ESP_OK) {
         return false;
     }
-    vTaskDelay(pdMS_TO_TICKS(2000));  // Reduced from 5s to 2s
+    vTaskDelay(pdMS_TO_TICKS(2000));
     
-    int rssi, ber;
+    int rssi = -999, ber = 99;
     if (esp_modem_get_signal_quality(dce, &rssi, &ber) != ESP_OK || 
         rssi <= MIN_GSM_SIGNAL_THRESHOLD) {
         ESP_LOGW(TAG, "GSM signal weak: %d", rssi);
@@ -490,7 +516,7 @@ static bool restart_ppp_connection(esp_modem_dce_t *dce)
     return true;
 }
 
-// ============= CONNECTIVITY MANAGER (FAST SWITCHING) =============
+// ============= CONNECTIVITY MANAGER =============
 static void connectivity_manager_task(void *arg)
 {
     esp_modem_dce_t *dce = (esp_modem_dce_t *)arg;
@@ -504,13 +530,11 @@ static void connectivity_manager_task(void *arg)
     while (1) {
         bool wifi_connected = (xEventGroupGetBits(event_group) & WIFI_CONNECTED_BIT);
         bool gsm_connected = (xEventGroupGetBits(event_group) & GSM_CONNECTED_BIT);
-        uint32_t now = esp_timer_get_time() / 1000;  // ms
+        uint32_t now = esp_timer_get_time() / 1000;
         
         if (xSemaphoreTake(conn_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
             
-            // Priority: WiFi > GSM
             if (!wifi_connected && !gsm_connected) {
-                // Try GSM if enough time passed
                 if (now - last_gsm_attempt > GSM_RECOVERY_DELAY_MS) {
                     ESP_LOGI(TAG, "Activating GSM...");
                     last_gsm_attempt = now;
@@ -519,7 +543,6 @@ static void connectivity_manager_task(void *arg)
                         gsm_activated = true;
                         current_conn_mode = CONN_MODE_GSM;
                         
-                        // Fast wait for PPP connection (15s instead of 45s)
                         EventBits_t bits = xEventGroupWaitBits(event_group,
                             GSM_CONNECTED_BIT | WIFI_CONNECTED_BIT,
                             pdFALSE, pdFALSE,
@@ -542,9 +565,7 @@ static void connectivity_manager_task(void *arg)
                     }
                 }
             }
-            // Fast switch: WiFi reconnected, switch from GSM immediately
             else if (wifi_connected && current_conn_mode == CONN_MODE_GSM) {
-                // Reduced minimum interval from 60s to 5s
                 if (now - last_switch_time > MIN_SWITCH_INTERVAL_MS) {
                     ESP_LOGI(TAG, "Switching GSM->WiFi");
                     current_conn_mode = CONN_MODE_WIFI;
@@ -557,7 +578,6 @@ static void connectivity_manager_task(void *arg)
                     xEventGroupSetBits(event_group, NETWORK_AVAILABLE_BIT);
                 }
             }
-            // GSM connected and WiFi not available
             else if (gsm_connected && !wifi_connected && current_conn_mode != CONN_MODE_GSM) {
                 current_conn_mode = CONN_MODE_GSM;
                 last_switch_time = now;
@@ -568,12 +588,11 @@ static void connectivity_manager_task(void *arg)
             xSemaphoreGive(conn_mutex);
         }
         
-        // Check more frequently for faster switching
         vTaskDelay(pdMS_TO_TICKS(NETWORK_CHECK_INTERVAL_MS));
     }
 }
 
-// ============= SENSOR TASK (OPTIMIZED) =============
+// ============= SENSOR TASK =============
 static void sensor_task(void *arg)
 {
     ESP_LOGI(TAG, "Sensor task started");
@@ -584,64 +603,64 @@ static void sensor_task(void *arg)
     static uint16_t alert_counter = 0;
     static uint8_t alert_ready = 0;
     
-    uint32_t last_publish_time = 0;
-    
     while (1) {
         if (data_mutex && xSemaphoreTake(data_mutex, portMAX_DELAY) == pdTRUE) {
             loop_counter++;
             alert_counter++;
-            comm_timeout_counter++;
+            /* Reset comm timeout on any sensor loop activity — proves the task is alive */
+            comm_timeout_counter = 0;
+            
             if (comm_timeout_counter > SYSTEM_RESET_TIMEOUT) {
                 ESP_LOGW(TAG, "No communication for %d ms, resetting system", SYSTEM_RESET_TIMEOUT * 1000);
                 esp_restart();
             }        
-            // Read analog zones - optimized with direct reads
+            
             for (uint8_t i = 0; i < (TOTAL_ZONE - 2); i++) {
                 zone_raw_value[i] = mcpReadData(&dev, i);
                 uint16_t bitmask = 1 << i;
                 
-                // Check if zone is snoozed
                 if (zone_snooze_state[i]) {
-                    // Zone is snoozed - don't generate alerts
-                    zone_alert_state[i] &= ~0x10;  // Clear alert state
+                    zone_alert_state[i] &= ~(0x01 | 0x02 | 0x10);
                     alert_flg &= ~bitmask;
-                    continue;  // Skip alert checking for this zone
+                    continue;
                 }
 
-                // Check if we need to set an alert
                 if (zone_raw_value[i] < zone_lower_limit[i]) {
-                    zone_alert_state[i] |= 0x01;    // Low alert
-                    // zone_alert_state[i] |= 0x10;    // Alert active
+                    zone_alert_state[i] |= 0x01;
                     alert_flg |= bitmask;
                 } else if (zone_raw_value[i] > zone_upper_limit[i]) {
-                    zone_alert_state[i] |= 0x02;    // High alert
-                    // zone_alert_state[i] |= 0x10;    // Alert active
+                    zone_alert_state[i] |= 0x02;
                     alert_flg |= bitmask;
                 } else {
-                    // Value is within range, clear the alert flag
-                    zone_alert_state[i] &= ~0x10;   // Clear alert state
+                    zone_alert_state[i] &= ~(0x01 | 0x02 | 0x10);
                     alert_flg &= ~bitmask;
                 }
             }
             
-            // Digital inputs - optimized
             zone_raw_value[TOTAL_ZONE-1] = 0;
             zone_raw_value[TOTAL_ZONE-2] = 0;
-            for (uint8_t i = 0; i < 10; i++) {  // Reduced from 20 to 10
+            for (uint8_t i = 0; i < 10; i++) {
                 zone_raw_value[TOTAL_ZONE-1] += gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_ARM_STATUS_PIN);
                 zone_raw_value[TOTAL_ZONE-2] += gpio_get_level((gpio_num_t)CONFIG_EXAMPLE_BUZZER_STATUS_PIN);
             }
             
-            // Process digital alerts
             for (int i = TOTAL_ZONE - 2; i < TOTAL_ZONE; i++) {
                 uint16_t bitmask = 1 << i;
-                if (zone_raw_value[i] > 8) {  // Reduced threshold
+                
+                /* Respect snooze for digital zones too */
+                if (zone_snooze_state[i]) {
+                    zone_alert_state[i] = 0;
+                    alert_flg &= ~bitmask;
+                    zone_raw_value[i] = (zone_raw_value[i] > 8) ? 1 : 0;
+                    continue;
+                }
+                
+                if (zone_raw_value[i] > 8) {
                     zone_raw_value[i] = 1;
-                    zone_alert_state[i] |= 0x02;
-                    // zone_alert_state[i] |= 0x82;
+                    zone_alert_state[i] = 0x02;
                     alert_flg |= bitmask;
                 } else {
-                    // zone_alert_state[i] &= ~0x80;
+                    zone_alert_state[i] = 0;
                     alert_flg &= ~bitmask;
                     zone_raw_value[i] = 0;
                 }
@@ -650,14 +669,14 @@ static void sensor_task(void *arg)
             if (alert_flg != prev_alert_flg) {
                 ESP_LOGI(TAG, "Alert: 0x%03X", alert_flg);
                 prev_alert_flg = alert_flg;
-                alert_ready = 1;
-                alert_counter = 0;
+                if (alert_flg != 0) {
+                    alert_ready = 1;
+                    alert_counter = 0;
+                }
             }
             
             xSemaphoreGive(data_mutex);
             
-            // Publish condition - optimized
-            uint32_t now = esp_timer_get_time() / 1000;  // ms
             bool publish_hb = (loop_counter >= PACKET_TIMEOUT);
             bool publish_alert = (alert_counter >= ALERT_TIMEOUT && alert_ready);
             
@@ -665,7 +684,6 @@ static void sensor_task(void *arg)
                 time_t now_ts;
                 time(&now_ts);
                 
-                // Include snooze state in the DNA packet
                 char snooze_str[64] = "";
                 for (int i = 0; i < TOTAL_ZONE; i++) {
                     char tmp[8];
@@ -674,12 +692,12 @@ static void sensor_task(void *arg)
                     if (i < TOTAL_ZONE - 1) strcat(snooze_str, ",");
                 }
 
-                    snprintf(data_buff, sizeof(data_buff),
+                snprintf(data_buff, sizeof(data_buff),
                     "{\"RAW\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
                     "\"ALERT\":[%d,%d,%d,%d,%d,%d,%d,%d,%d,%d],"
                     "\"DNA\":[\"%s\",%lld,\"%s\",\"%s\"],\"TS\":\"%lld\","
                     "\"CONN\":\"%s%d\",\"FW\":\"%s\","
-                    "\"THRESH\":[%d,%d],\"OS\":%d,\"SNOOZE\":[%s]}%c",
+                    "\"THRESH\":[%d,%d],\"OS\":%d,\"SNOOZE\":[%s]}",
                     zone_raw_value[0], zone_raw_value[1], zone_raw_value[2], zone_raw_value[3],
                     zone_raw_value[4], zone_raw_value[5], zone_raw_value[6], zone_raw_value[7],
                     zone_raw_value[8], zone_raw_value[9],
@@ -690,7 +708,7 @@ static void sensor_task(void *arg)
                     (long long)now_ts,
                     (current_conn_mode == CONN_MODE_WIFI) ? "WIFI" : "GSM", sim_select_flag,
                     FW_VER, zone_lower_limit[0], zone_upper_limit[0], ota_state,
-                    snooze_str, 0);
+                    snooze_str);
                 
                 if (publish_hb) {
                     snprintf(topic_buff, sizeof(topic_buff), "/ZIGRON/%s/HB", mac_string);
@@ -704,15 +722,13 @@ static void sensor_task(void *arg)
                 if (mqtt_client && mqtt_started) {
                     int pub = esp_mqtt_client_publish(mqtt_client, topic_buff, data_buff, 0, 0, 0);
                     if (pub >= 0) {
-                        comm_timeout_counter = 0;
-                        // memset(zone_alert_state, 0, sizeof(zone_alert_state));
                         ESP_LOGI(TAG, "Published to: %s", topic_buff);
                     }
                 }
             }
         }
         
-        vTaskDelay(pdMS_TO_TICKS(100));  // 100ms loop = faster response
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -729,7 +745,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     (current_conn_mode == CONN_MODE_WIFI) ? "WiFi" : "GSM");
             xEventGroupSetBits(event_group, MQTT_CONNECTED_BIT);
             
-            // Subscribe to topics
             char sub_topic[64];
             snprintf(sub_topic, sizeof(sub_topic), "/ZIGRON/%s/#", mac_string);
             esp_mqtt_client_subscribe(client, sub_topic, 0);
@@ -747,15 +762,12 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             memcpy(topic, event->topic, topic_len);
             topic[topic_len] = '\0';
             
-            // Parse topics efficiently
-            char config_topic[64], ota_topic[64], clear_topic[64], cmd_topic[64], snooze_topic[64];
+            char config_topic[64], ota_topic[64], clear_topic[64], cmd_topic[64];
             snprintf(config_topic, sizeof(config_topic), "/ZIGRON/%s/CONFIG", mac_string);
             snprintf(ota_topic, sizeof(ota_topic), "/ZIGRON/%s/OTA", mac_string);
             snprintf(clear_topic, sizeof(clear_topic), "/ZIGRON/%s/CLEAR", mac_string);
             snprintf(cmd_topic, sizeof(cmd_topic), "/ZIGRON/%s/COMMAND", mac_string);
-            snprintf(snooze_topic, sizeof(snooze_topic), "/ZIGRON/%s/SNOOZE", mac_string);
             
-            // Handle CLEAR
             if (strcmp(topic, clear_topic) == 0) {
                 if (data_mutex && xSemaphoreTake(data_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                     memset(zone_alert_state, 0, sizeof(zone_alert_state));
@@ -763,13 +775,10 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     ESP_LOGI(TAG, "Alerts cleared");
                 }
             }
-            // Handle CONFIG
             else if (strcmp(topic, config_topic) == 0) {
                 handle_mqtt_config_command(event->data, event->data_len);
             }
-            // Handle OTA
             else if (strcmp(topic, ota_topic) == 0) {
-                // ... existing OTA handling code ...
                 ESP_LOGI(TAG, "OTA command received");
                 char payload[512] = {0};
                 int len = event->data_len < sizeof(payload)-1 ? event->data_len : sizeof(payload)-1;
@@ -781,7 +790,8 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     cJSON *ver = cJSON_GetObjectItem(root, "version");
                     
                     if (url && cJSON_IsString(url)) {
-                        char new_url[256], new_ver[64] = {0};
+                        char new_url[256] = {0};
+                        char new_ver[64] = {0};
                         strncpy(new_url, url->valuestring, sizeof(new_url)-1);
                         if (ver && cJSON_IsString(ver)) {
                             strncpy(new_ver, ver->valuestring, sizeof(new_ver)-1);
@@ -809,7 +819,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     cJSON_Delete(root);
                 }
             }
-            // Handle COMMAND
             else if (strcmp(topic, cmd_topic) == 0) {
                 char cmd[32] = {0};
                 int len = event->data_len < sizeof(cmd)-1 ? event->data_len : sizeof(cmd)-1;
@@ -819,40 +828,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                 if (strcmp(cmd, "RESET") == 0) {
                     ESP_LOGI(TAG, "RESET command received via MQTT");
                     esp_restart();
-                }
-                else if (strcmp(cmd, "GET_CONFIG") == 0) {
-                    ESP_LOGI(TAG, "GET_CONFIG command received via MQTT");
-                    // Publish current configuration
-                    char config_json[1024];
-                    snprintf(config_json, sizeof(config_json),
-                        "{\"ssid\":\"%s\","
-                        "\"broker\":\"%s\","
-                        "\"intrvl\":%lu,"
-                        "\"thresh\":[",
-                        g_config.wifi_ssid,
-                        g_config.mqtt_broker_url,
-                        g_config.publish_interval_ms);
-                    
-                    // Add thresholds
-                    char thresholds_str[512] = "";
-                    for (int i = 0; i < TOTAL_ZONE; i++) {
-                        char zone_str[64];
-                        snprintf(zone_str, sizeof(zone_str), 
-                            "{\"z\":%d,\"l\":%d,\"h\":%d,\"s\":%d}%s",
-                            i, g_config.zone_lower[i], g_config.zone_upper[i],
-                            g_config.zone_snooze[i],
-                            (i < TOTAL_ZONE - 1) ? "," : "");
-                        strcat(thresholds_str, zone_str);
-                    }
-                    
-                    strcat(config_json, thresholds_str);
-                    strcat(config_json, "]}");
-                    
-                    // Publish to config response topic
-                    char response_topic[64];
-                    snprintf(response_topic, sizeof(response_topic), "/ZIGRON/%s/CONFIG_RESPONSE", mac_string);
-                    esp_mqtt_client_publish(client, response_topic, config_json, 0, 0, 0);
-                    ESP_LOGI(TAG, "Published configuration to %s", response_topic);
                 }
             }
             break;
@@ -870,14 +845,34 @@ static void mqtt_task(void *arg)
     esp_modem_dce_t *dce = (esp_modem_dce_t *)arg;
     
     while (1) {
-        // Wait for network
         xEventGroupWaitBits(event_group, NETWORK_AVAILABLE_BIT,
                           pdFALSE, pdFALSE, portMAX_DELAY);
         
-        // Initialize MQTT if needed
+        /* Handle broker URL change */
+        if (xEventGroupGetBits(event_group) & MQTT_RECONNECT_BIT) {
+            xEventGroupClearBits(event_group, MQTT_RECONNECT_BIT);
+            if (mqtt_client) {
+                esp_mqtt_client_stop(mqtt_client);
+                esp_mqtt_client_destroy(mqtt_client);
+                mqtt_client = NULL;
+            }
+            mqtt_started = false;
+            ESP_LOGI(TAG, "MQTT client reset for new broker");
+        }
+        
         if (!mqtt_client) {
+            char broker_copy[128];
+            if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                strncpy(broker_copy, g_config.mqtt_broker_url, sizeof(broker_copy) - 1);
+                broker_copy[sizeof(broker_copy) - 1] = '\0';
+                xSemaphoreGive(config_mutex);
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
+            
             esp_mqtt_client_config_t cfg = {
-                .broker.address.uri = g_config.mqtt_broker_url,
+                .broker.address.uri = broker_copy,
                 .network.timeout_ms = 10000,
                 .session.keepalive = 30,
                 .network.reconnect_timeout_ms = 5000,
@@ -888,17 +883,6 @@ static void mqtt_task(void *arg)
             }
         }
         
-        if (xEventGroupGetBits(event_group) & MQTT_RECONNECT_BIT) {
-            xEventGroupClearBits(event_group, MQTT_RECONNECT_BIT);
-            if (mqtt_client) {
-                esp_mqtt_client_stop(mqtt_client);
-                esp_mqtt_client_destroy(mqtt_client);
-                mqtt_client = NULL;
-            }
-            mqtt_started = false;
-        }
-        
-        // Start MQTT if not started
         if (mqtt_client && !mqtt_started) {
             if (esp_mqtt_client_start(mqtt_client) == ESP_OK) {
                 mqtt_started = true;
@@ -906,9 +890,7 @@ static void mqtt_task(void *arg)
             }
         }
         
-        // Check connection health
         if (mqtt_client && mqtt_started) {
-            // Check if MQTT is still connected
             if (!(xEventGroupGetBits(event_group) & MQTT_CONNECTED_BIT)) {
                 ESP_LOGW(TAG, "MQTT not connected, restarting...");
                 esp_mqtt_client_stop(mqtt_client);
@@ -974,11 +956,14 @@ static esp_err_t _http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-// ============= HANDLE MQTT CONFIG =============
+// ============= HANDLE CONFIG (shared by MQTT and BLE) =============
 static void handle_mqtt_config_command(const char *payload, int payload_len)
 {
     char copy[512];
-    if (payload_len >= sizeof(copy)) return;
+    if (payload_len >= sizeof(copy)) {
+        ESP_LOGW(TAG, "Config payload too large");
+        return;
+    }
     memcpy(copy, payload, payload_len);
     copy[payload_len] = '\0';
     
@@ -989,12 +974,22 @@ static void handle_mqtt_config_command(const char *payload, int payload_len)
     }
     
     bool changed = false;
+    bool wifi_changed = false;
+    bool broker_changed = false;
+    
+    if (config_mutex && xSemaphoreTake(config_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "Config busy");
+        return;
+    }
     
     cJSON *ssid = cJSON_GetObjectItem(root, "wifi_ssid");
     if (ssid && cJSON_IsString(ssid)) {
         if (strcmp(ssid->valuestring, g_config.wifi_ssid) != 0) {
             strncpy(g_config.wifi_ssid, ssid->valuestring, sizeof(g_config.wifi_ssid)-1);
+            g_config.wifi_ssid[sizeof(g_config.wifi_ssid)-1] = '\0';
             changed = true;
+            wifi_changed = true;
         }
     }
     
@@ -1002,7 +997,9 @@ static void handle_mqtt_config_command(const char *payload, int payload_len)
     if (pass && cJSON_IsString(pass)) {
         if (strcmp(pass->valuestring, g_config.wifi_password) != 0) {
             strncpy(g_config.wifi_password, pass->valuestring, sizeof(g_config.wifi_password)-1);
+            g_config.wifi_password[sizeof(g_config.wifi_password)-1] = '\0';
             changed = true;
+            wifi_changed = true;
         }
     }
     
@@ -1010,7 +1007,9 @@ static void handle_mqtt_config_command(const char *payload, int payload_len)
     if (broker && cJSON_IsString(broker)) {
         if (strcmp(broker->valuestring, g_config.mqtt_broker_url) != 0) {
             strncpy(g_config.mqtt_broker_url, broker->valuestring, sizeof(g_config.mqtt_broker_url)-1);
+            g_config.mqtt_broker_url[sizeof(g_config.mqtt_broker_url)-1] = '\0';
             changed = true;
+            broker_changed = true;
         }
     }
     
@@ -1033,63 +1032,265 @@ static void handle_mqtt_config_command(const char *payload, int payload_len)
             cJSON *low = cJSON_GetObjectItem(item, "l");
             cJSON *high = cJSON_GetObjectItem(item, "h");
             if (low && high && cJSON_IsNumber(low) && cJSON_IsNumber(high)) {
-                uint16_t nl = low->valueint;
-                uint16_t nh = high->valueint;
+                int nl = low->valueint;
+                int nh = high->valueint;
+                if (nl < 0) nl = 0;
+                if (nl > 4095) nl = 4095;
+                if (nh < 0) nh = 0;
+                if (nh > 4095) nh = 4095;
+                if (nl > nh) { int t = nl; nl = nh; nh = t; }
+                
                 if (nl != g_config.zone_lower[i] || nh != g_config.zone_upper[i]) {
-                    g_config.zone_lower[i] = nl;
-                    g_config.zone_upper[i] = nh;
-                    zone_lower_limit[i] = nl;
-                    zone_upper_limit[i] = nh;
+                    g_config.zone_lower[i] = (uint16_t)nl;
+                    g_config.zone_upper[i] = (uint16_t)nh;
+                    zone_lower_limit[i] = (uint16_t)nl;
+                    zone_upper_limit[i] = (uint16_t)nh;
                     changed = true;
                 }
             }
             
             cJSON *snooze = cJSON_GetObjectItem(item, "s");
-            if(snooze && cJSON_IsNumber(snooze)){
-                g_config.zone_snooze[i] = snooze->valueint;
-                zone_snooze_state[i] = snooze->valueint;
-                changed = true;
+            if (snooze && cJSON_IsNumber(snooze)) {
+                uint8_t sv = snooze->valueint ? 1 : 0;
+                if (g_config.zone_snooze[i] != sv) {
+                    g_config.zone_snooze[i] = sv;
+                    zone_snooze_state[i] = sv;
+                    changed = true;
+                }
             }
         }
     }
     
+    xSemaphoreGive(config_mutex);
     cJSON_Delete(root);
     
     if (changed) {
         if (save_config_to_nvs() == ESP_OK) {
-            ESP_LOGI(TAG, "Config saved");
-            // Trigger WiFi reconnection if SSID changed
-            if (strlen(g_config.wifi_ssid) > 0) {
+            ESP_LOGI(TAG, "Config saved (wifi_changed=%d broker_changed=%d)", wifi_changed, broker_changed);
+            if (wifi_changed) {
                 xEventGroupSetBits(event_group, WIFI_RECONNECT_BIT);
             }
-            // Trigger MQTT reconnection if broker URL changed
-            if (strlen(g_config.mqtt_broker_url) > 0) {
+            if (broker_changed) {
                 xEventGroupSetBits(event_group, MQTT_RECONNECT_BIT);
             }
         }
     }
 }
 
+// ============= BLE IMPLEMENTATION =============
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg)
+{
+    switch (event->type) {
+        case BLE_GAP_EVENT_CONNECT:
+            ESP_LOGI(TAG, "BLE connected; status=%d", event->connect.status);
+            if (event->connect.status == 0) {
+                ble_conn_handle = event->connect.conn_handle;
+            } else {
+                ble_advertise();
+            }
+            return 0;
+            
+        case BLE_GAP_EVENT_DISCONNECT:
+            ESP_LOGI(TAG, "BLE disconnected; reason=%d", event->disconnect.reason);
+            ble_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+            ble_advertise();
+            return 0;
+            
+        case BLE_GAP_EVENT_ADV_COMPLETE:
+            ESP_LOGI(TAG, "BLE advertising complete");
+            ble_advertise();
+            return 0;
+            
+        case BLE_GAP_EVENT_MTU:
+            ESP_LOGI(TAG, "BLE MTU update: conn=%d mtu=%d",
+                     event->mtu.conn_handle, event->mtu.value);
+            return 0;
+            
+        default:
+            return 0;
+    }
+}
+
+static int ble_config_chr_access(uint16_t conn_handle, uint16_t attr_handle,
+                                 struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+        if (len == 0 || len >= BLE_CONFIG_MAX_LEN) {
+            ESP_LOGW(TAG, "BLE config invalid length: %d", len);
+            return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+        }
+        
+        char buf[BLE_CONFIG_MAX_LEN];
+        int rc = os_mbuf_copydata(ctxt->om, 0, len, buf);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "BLE mbuf copy failed: %d", rc);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        buf[len] = '\0';
+        
+        ESP_LOGI(TAG, "BLE config received (%d bytes): %s", len, buf);
+        
+        /* Reuse the same config parser as MQTT */
+        handle_mqtt_config_command(buf, len);
+        
+        return 0;
+    }
+    
+    return BLE_ATT_ERR_UNLIKELY;
+}
+
+static const struct ble_gatt_svc_def ble_gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = BLE_UUID16_DECLARE(BLE_SVC_UUID),
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                .uuid = BLE_UUID16_DECLARE(BLE_CHAR_UUID),
+                .access_cb = ble_config_chr_access,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+                .val_handle = &ble_config_val_handle,
+            },
+            { 0 }
+        },
+    },
+    { 0 }
+};
+
+static void ble_advertise(void)
+{
+    struct ble_gap_adv_params adv_params;
+    struct ble_hs_adv_fields fields;
+    int rc;
+    
+    memset(&fields, 0, sizeof fields);
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name = (uint8_t *)BLE_DEVICE_NAME;
+    fields.name_len = strlen(BLE_DEVICE_NAME);
+    fields.name_is_complete = 1;
+    
+    rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_set_fields failed: %d", rc);
+        return;
+    }
+    
+    memset(&adv_params, 0, sizeof adv_params);
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    
+    rc = ble_gap_adv_start(ble_own_addr_type, NULL, BLE_HS_FOREVER,
+                           &adv_params, ble_gap_event, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gap_adv_start failed: %d", rc);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "BLE advertising as '%s'", BLE_DEVICE_NAME);
+}
+
+static void ble_on_sync(void)
+{
+    int rc;
+    
+    rc = ble_hs_util_ensure_addr(0);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_util_ensure_addr failed: %d", rc);
+        return;
+    }
+    
+    rc = ble_hs_id_infer_auto(0, &ble_own_addr_type);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_hs_id_infer_auto failed: %d", rc);
+        return;
+    }
+    
+    uint8_t addr_val[6] = {0};
+    ble_hs_id_copy_addr(ble_own_addr_type, addr_val, NULL);
+    ESP_LOGI(TAG, "BLE address: %02x:%02x:%02x:%02x:%02x:%02x",
+             addr_val[5], addr_val[4], addr_val[3],
+             addr_val[2], addr_val[1], addr_val[0]);
+    
+    ble_advertise();
+}
+
+static void ble_on_reset(int reason)
+{
+    ESP_LOGW(TAG, "BLE host reset; reason=%d", reason);
+}
+
+static void ble_host_task(void *param)
+{
+    ESP_LOGI(TAG, "BLE host task started");
+    nimble_port_run();
+    nimble_port_freertos_deinit();
+}
+
+static void ble_init(void)
+{
+    int rc;
+    
+    ESP_LOGI(TAG, "Initializing BLE...");
+    
+    esp_err_t ret = nimble_port_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "nimble_port_init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ble_hs_cfg.sync_cb = ble_on_sync;
+    ble_hs_cfg.reset_cb = ble_on_reset;
+    
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    
+    rc = ble_gatts_count_cfg(ble_gatt_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gatts_count_cfg failed: %d", rc);
+        return;
+    }
+    
+    rc = ble_gatts_add_svcs(ble_gatt_svcs);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_gatts_add_svcs failed: %d", rc);
+        return;
+    }
+    
+    rc = ble_svc_gap_device_name_set(BLE_DEVICE_NAME);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ble_svc_gap_device_name_set failed: %d", rc);
+    }
+    
+    nimble_port_freertos_init(ble_host_task);
+    
+    ESP_LOGI(TAG, "BLE service 0x%04X, char 0x%04X ready", BLE_SVC_UUID, BLE_CHAR_UUID);
+}
+
 // ============= APP MAIN =============
 void app_main(void)
 {
-    // Set log levels
     esp_log_level_set("esp_http_client", ESP_LOG_WARN);
     esp_log_level_set("esp_https_ota", ESP_LOG_WARN);
     esp_log_level_set("wifi", ESP_LOG_WARN);
     esp_log_level_set(TAG, ESP_LOG_INFO);
     
-    ESP_LOGI(TAG, "=== ZIGRON OPTIMIZED STARTING ===");
+    ESP_LOGI(TAG, "=== ZIGRON OPTIMIZED + BLE CONFIG STARTING ===");
     ESP_LOGI(TAG, "FW Version: %s", FW_VER);
     
-    // NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
     }
     
-    // Load config
+    /* Create config mutex before loading config */
+    config_mutex = xSemaphoreCreateMutex();
+    if (!config_mutex) {
+        ESP_LOGE(TAG, "Failed to create config mutex");
+        return;
+    }
+    
     ret = load_config_from_nvs();
     if (ret != ESP_OK) {
         memcpy(g_config.zone_lower, zone_lower_limit, sizeof(zone_lower_limit));
@@ -1097,7 +1298,6 @@ void app_main(void)
         save_config_to_nvs();
     }
     
-    // Initialize hardware
     mcpInit(&dev, MCP3008, CONFIG_MISO_GPIO, CONFIG_MOSI_GPIO,
             CONFIG_SCLK_GPIO, CONFIG_CS_GPIO, MCP_SINGLE);
     
@@ -1107,7 +1307,6 @@ void app_main(void)
             mac_addr[3], mac_addr[4], mac_addr[5]);
     ESP_LOGI(TAG, "MAC: %s", mac_string);
     
-    // Create mutexes
     event_group = xEventGroupCreate();
     data_mutex = xSemaphoreCreateMutex();
     conn_mutex = xSemaphoreCreateMutex();
@@ -1119,21 +1318,17 @@ void app_main(void)
         return;
     }
     
-    // Network
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     
-    // WiFi
     init_wifi();
     
-    // GPIO setup
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_LED_STATUS_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_SIM_SELECT_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_BUZZER_STATUS_PIN, GPIO_MODE_INPUT);
     gpio_set_direction((gpio_num_t)CONFIG_EXAMPLE_ARM_STATUS_PIN, GPIO_MODE_INPUT);
     
-    // Reset modem
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(100));
     gpio_set_level((gpio_num_t)CONFIG_EXAMPLE_MODEM_RESET_PIN, 0);
@@ -1141,12 +1336,11 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(100));
     
     xTaskCreate(sensor_task, "sensor", 6144, NULL, 3, &sensor_task_handle);
-
-    // GSM modem
+    
     esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG("internet");
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_PPP();
-    esp_netif_t *esp_netif = esp_netif_new(&netif_cfg);
-    assert(esp_netif);
+    esp_netif_t *ppp_netif = esp_netif_new(&netif_cfg);
+    assert(ppp_netif);
     
     esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
     dte_cfg.uart_config.tx_io_num = CONFIG_EXAMPLE_MODEM_UART_TX_PIN;
@@ -1155,11 +1349,10 @@ void app_main(void)
     dte_cfg.uart_config.cts_io_num = CONFIG_EXAMPLE_MODEM_UART_CTS_PIN;
     dte_cfg.uart_config.flow_control = EXAMPLE_FLOW_CONTROL;
     
-    esp_modem_dce_t *dce = esp_modem_new_dev(ESP_MODEM_DCE_EC20, &dte_cfg, &dce_cfg, esp_netif);
+    esp_modem_dce_t *dce = esp_modem_new_dev(ESP_MODEM_DCE_EC20, &dte_cfg, &dce_cfg, ppp_netif);
     if (dce) {
         ESP_LOGI(TAG, "GSM modem initialized");
-        // Test communication
-        int rssi, ber;
+        int rssi = -999, ber = 99;
         for (int i = 0; i < 3; i++) {
             if (esp_modem_get_signal_quality(dce, &rssi, &ber) == ESP_OK) {
                 ESP_LOGI(TAG, "GSM signal: %d", rssi);
@@ -1187,22 +1380,20 @@ void app_main(void)
         ESP_LOGW(TAG, "GSM modem not available");
     }
     
-    // Register IP event handlers
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, &on_ip_event, NULL));
     ESP_ERROR_CHECK(esp_event_handler_register(NETIF_PPP_STATUS, ESP_EVENT_ANY_ID, &on_ppp_changed, NULL));
     
-    // ===== FIX: Clear only valid event bits =====
-    // Define the valid bits mask (bits 0-23 are valid, 24-31 are reserved)
     #define VALID_EVENT_BITS (WIFI_CONNECTED_BIT | GSM_CONNECTED_BIT | \
                              MQTT_CONNECTED_BIT | OTA_TRIGGER_BIT | \
                              RECONFIG_TRIGGER_BIT | WIFI_RECONNECT_BIT | \
-                             NETWORK_AVAILABLE_BIT)
+                             NETWORK_AVAILABLE_BIT | MQTT_RECONNECT_BIT)
     
     xEventGroupClearBits(event_group, VALID_EVENT_BITS);
     
-    // Create tasks with optimized stack sizes
+    /* Initialize BLE configuration interface */
+    ble_init();
+    
     xTaskCreate(wifi_connection_task, "wifi", 8192, NULL, 4, &wifi_task_handle);
-    // xTaskCreate(sensor_task, "sensor", 6144, NULL, 3, &sensor_task_handle);
     xTaskCreate(mqtt_task, "mqtt", 8192, dce, 5, &mqtt_task_handle);
     xTaskCreate(ota_task, "ota", 8192, NULL, 5, &ota_task_handle);
     
@@ -1211,11 +1402,24 @@ void app_main(void)
     }
     
     ESP_LOGI(TAG, "System ready!");
+    ESP_LOGI(TAG, "BLE config: '%s' service 0x%04X char 0x%04X",
+             BLE_DEVICE_NAME, BLE_SVC_UUID, BLE_CHAR_UUID);
     ESP_LOGI(TAG, "OTA topic: /ZIGRON/%s/OTA", mac_string);
     ESP_LOGI(TAG, "Config topic: /ZIGRON/%s/CONFIG", mac_string);
 }
 
-static void on_ppp_changed(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {}
+static void on_ppp_changed(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    if (event_id >= NETIF_PPP_ERRORUSER) {
+        ESP_LOGW(TAG, "PPP error event: %d", (int)event_id);
+        xEventGroupClearBits(event_group, GSM_CONNECTED_BIT);
+        EventBits_t bits = xEventGroupGetBits(event_group);
+        if (!(bits & WIFI_CONNECTED_BIT)) {
+            xEventGroupClearBits(event_group, NETWORK_AVAILABLE_BIT);
+        }
+    }
+}
+
 static void on_ip_event(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     if (event_id == IP_EVENT_PPP_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
@@ -1223,6 +1427,10 @@ static void on_ip_event(void *arg, esp_event_base_t event_base, int32_t event_id
         xEventGroupSetBits(event_group, GSM_CONNECTED_BIT | NETWORK_AVAILABLE_BIT);
     } else if (event_id == IP_EVENT_PPP_LOST_IP) {
         ESP_LOGI(TAG, "PPP lost");
-        xEventGroupClearBits(event_group, GSM_CONNECTED_BIT | NETWORK_AVAILABLE_BIT);
+        xEventGroupClearBits(event_group, GSM_CONNECTED_BIT);
+        EventBits_t bits = xEventGroupGetBits(event_group);
+        if (!(bits & WIFI_CONNECTED_BIT)) {
+            xEventGroupClearBits(event_group, NETWORK_AVAILABLE_BIT);
+        }
     }
 }
