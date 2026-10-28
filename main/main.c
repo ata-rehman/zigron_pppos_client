@@ -50,7 +50,7 @@
 #define SYSTEM_RESET_TIMEOUT    9000         // 900s = 15 minutes in case of no communication system gets reset itself 
 #define PACKET_TIMEOUT          600          // 60 seconds
 #define ALERT_TIMEOUT           50           // 5 seconds
-#define FW_VER                  "0.13b"       // Updated version
+#define FW_VER                  "0.14a"       // Updated version
 #define EXAMPLE_FLOW_CONTROL    ESP_MODEM_FLOW_CONTROL_NONE
 
 // Optimized timing parameters
@@ -124,8 +124,7 @@ static char imei_buffer[32] = "0";
 
 
 // ============= ADD THESE GLOBAL VARIABLES =============
-static uint8_t zone_snooze[TOTAL_ZONE] = {0};  // 1 = snoozed/silent, 0 = active
-static bool snooze_all = false;  // Global snooze flag
+static uint8_t zone_snooze_state[TOTAL_ZONE] = {0};  // 1 = snoozed/silent, 0 = active
 
 // ============= CONFIGURATION =============
 typedef struct {
@@ -236,7 +235,7 @@ static esp_err_t save_config_to_nvs(void)
     if (err != ESP_OK) return err;
 
     // Copy current snooze state to config
-    memcpy(g_config.zone_snooze, zone_snooze, sizeof(zone_snooze));
+    memcpy(g_config.zone_snooze, zone_snooze_state, sizeof(zone_snooze_state));
     
     err = nvs_set_blob(handle, "config", &g_config, sizeof(g_config));
     if (err == ESP_OK) err = nvs_commit(handle);
@@ -258,13 +257,13 @@ static esp_err_t load_config_from_nvs(void)
         if (err == ESP_OK) {
             memcpy(zone_lower_limit, g_config.zone_lower, sizeof(g_config.zone_lower));
             memcpy(zone_upper_limit, g_config.zone_upper, sizeof(g_config.zone_upper));
-            memcpy(zone_snooze, g_config.zone_snooze, sizeof(g_config.zone_snooze));
+            memcpy(zone_snooze_state, g_config.zone_snooze, sizeof(g_config.zone_snooze));
             ESP_LOGI(TAG, "Config loaded: SSID=%s", g_config.wifi_ssid);
         }
     } else {
         memcpy(g_config.zone_lower, zone_lower_limit, sizeof(zone_lower_limit));
         memcpy(g_config.zone_upper, zone_upper_limit, sizeof(zone_upper_limit));
-        memcpy(g_config.zone_snooze, zone_snooze, sizeof(zone_snooze));
+        memcpy(g_config.zone_snooze, zone_snooze_state, sizeof(zone_snooze_state));
         err = ESP_ERR_NOT_FOUND;
     }
     
@@ -601,7 +600,7 @@ static void sensor_task(void *arg)
                 uint16_t bitmask = 1 << i;
                 
                 // Check if zone is snoozed
-                if (zone_snooze[i]) {
+                if (zone_snooze_state[i]) {
                     // Zone is snoozed - don't generate alerts
                     zone_alert_state[i] &= ~0x10;  // Clear alert state
                     alert_flg &= ~bitmask;
@@ -669,7 +668,7 @@ static void sensor_task(void *arg)
                 char snooze_str[64] = "";
                 for (int i = 0; i < TOTAL_ZONE; i++) {
                     char tmp[8];
-                    snprintf(tmp, sizeof(tmp), "%d", zone_snooze[i]);
+                    snprintf(tmp, sizeof(tmp), "%d", zone_snooze_state[i]);
                     strcat(snooze_str, tmp);
                     if (i < TOTAL_ZONE - 1) strcat(snooze_str, ",");
                 }
@@ -767,11 +766,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
             else if (strcmp(topic, config_topic) == 0) {
                 handle_mqtt_config_command(event->data, event->data_len);
             }
-            // Handle SNOOZE
-            else if (strcmp(topic, snooze_topic) == 0) {
-                ESP_LOGI(TAG, "SNOOZE command received");
-                handle_snooze_command(event->data, event->data_len);
-            }
             // Handle OTA
             else if (strcmp(topic, ota_topic) == 0) {
                 // ... existing OTA handling code ...
@@ -833,21 +827,19 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                         "{\"ssid\":\"%s\","
                         "\"broker\":\"%s\","
                         "\"intrvl\":%lu,"
-                        "\"snooze_all\":%s,"
                         "\"thresh\":[",
                         g_config.wifi_ssid,
                         g_config.mqtt_broker_url,
-                        g_config.publish_interval_ms,
-                        snooze_all ? "true" : "false");
+                        g_config.publish_interval_ms);
                     
                     // Add thresholds
                     char thresholds_str[512] = "";
                     for (int i = 0; i < TOTAL_ZONE; i++) {
                         char zone_str[64];
                         snprintf(zone_str, sizeof(zone_str), 
-                            "{\"z\":%d,\"l\":%d,\"h\":%d,\"snooze\":%s}%s",
+                            "{\"z\":%d,\"l\":%d,\"h\":%d,\"s\":%d}%s",
                             i, g_config.zone_lower[i], g_config.zone_upper[i],
-                            zone_snooze[i] ? "true" : "false",
+                            g_config.zone_snooze[i],
                             (i < TOTAL_ZONE - 1) ? "," : "");
                         strcat(thresholds_str, zone_str);
                     }
@@ -860,32 +852,6 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base,
                     snprintf(response_topic, sizeof(response_topic), "/ZIGRON/%s/CONFIG_RESPONSE", mac_string);
                     esp_mqtt_client_publish(client, response_topic, config_json, 0, 0, 0);
                     ESP_LOGI(TAG, "Published configuration to %s", response_topic);
-                }
-                else if (strcmp(cmd, "GET_SNOOZE") == 0) {
-                    ESP_LOGI(TAG, "GET_SNOOZE command received via MQTT");
-                    // Publish current snooze state
-                    char response_topic[64];
-                    char response_json[512];
-                    snprintf(response_topic, sizeof(response_topic), "/ZIGRON/%s/SNOOZE_RESPONSE", mac_string);
-                    
-                    snprintf(response_json, sizeof(response_json), 
-                            "{\"snooze_all\":%s,\"zones\":[",
-                            snooze_all ? "true" : "false");
-                    
-                    char zones_str[256] = "";
-                    for (int i = 0; i < TOTAL_ZONE; i++) {
-                        char zone_str[32];
-                        snprintf(zone_str, sizeof(zone_str), 
-                                "{\"zone\":%d,\"snooze\":%s}%s",
-                                i, zone_snooze[i] ? "true" : "false",
-                                (i < TOTAL_ZONE - 1) ? "," : "");
-                        strcat(zones_str, zone_str);
-                    }
-                    strcat(response_json, zones_str);
-                    strcat(response_json, "]}");
-                    
-                    esp_mqtt_client_publish(client, response_topic, response_json, 0, 0, 0);
-                    ESP_LOGI(TAG, "Published snooze state to %s", response_topic);
                 }
             }
             break;
@@ -1066,6 +1032,13 @@ static void handle_mqtt_config_command(const char *payload, int payload_len)
                     changed = true;
                 }
             }
+            
+            cJSON *snooze = cJSON_GetObjectItem(item, "s");
+            if(snooze && cJSON_IsNumber(snooze)){
+                g_config.zone_snooze[i] = snooze->valueint;
+                zone_snooze_state[i] = snooze->valueint;
+                changed = true;
+            }
         }
     }
     
@@ -1081,138 +1054,6 @@ static void handle_mqtt_config_command(const char *payload, int payload_len)
         }
     }
 }
-
-// ============= ADD FUNCTION TO HANDLE SNOOZE COMMAND =============
-static void handle_snooze_command(const char *payload, int payload_len)
-{
-    char copy[256];
-    if (payload_len >= sizeof(copy)) {
-        ESP_LOGE(TAG, "Snooze payload too large");
-        return;
-    }
-    memcpy(copy, payload, payload_len);
-    copy[payload_len] = '\0';
-    
-    cJSON *root = cJSON_Parse(copy);
-    if (!root) {
-        ESP_LOGE(TAG, "Invalid JSON for snooze command");
-        return;
-    }
-    
-    bool changed = false;
-    bool all_snooze = false;
-    bool all_active = false;
-    
-    // Check for "all" parameter
-    cJSON *all = cJSON_GetObjectItem(root, "all");
-    if (all && cJSON_IsBool(all)) {
-        all_snooze = cJSON_IsTrue(all);
-        if (all_snooze) {
-            // Snooze all zones
-            for (int i = 0; i < TOTAL_ZONE; i++) {
-                if (zone_snooze[i] != 1) {
-                    zone_snooze[i] = 1;
-                    changed = true;
-                }
-            }
-            snooze_all = true;
-            ESP_LOGI(TAG, "All zones snoozed (silent mode)");
-        } else {
-            // Activate all zones (clear snooze)
-            for (int i = 0; i < TOTAL_ZONE; i++) {
-                if (zone_snooze[i] != 0) {
-                    zone_snooze[i] = 0;
-                    changed = true;
-                }
-            }
-            snooze_all = false;
-            ESP_LOGI(TAG, "All zones activated (alert mode)");
-        }
-    }
-    
-    // Check for specific zone configuration
-    cJSON *zones = cJSON_GetObjectItem(root, "zones");
-    if (zones && cJSON_IsArray(zones)) {
-        int size = cJSON_GetArraySize(zones);
-        for (int i = 0; i < size; i++) {
-            cJSON *item = cJSON_GetArrayItem(zones, i);
-            if (!cJSON_IsObject(item)) continue;
-            
-            cJSON *zone_num = cJSON_GetObjectItem(item, "zone");
-            cJSON *snooze = cJSON_GetObjectItem(item, "snooze");
-            
-            if (zone_num && snooze && cJSON_IsNumber(zone_num) && cJSON_IsBool(snooze)) {
-                int zone_idx = zone_num->valueint;
-                if (zone_idx >= 0 && zone_idx < TOTAL_ZONE) {
-                    uint8_t new_state = cJSON_IsTrue(snooze) ? 1 : 0;
-                    if (zone_snooze[zone_idx] != new_state) {
-                        zone_snooze[zone_idx] = new_state;
-                        changed = true;
-                        ESP_LOGI(TAG, "Zone %d %s", zone_idx, 
-                                new_state ? "snoozed (silent)" : "activated");
-                        
-                        // If a zone is activated, clear snooze_all flag
-                        if (!new_state) {
-                            snooze_all = false;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // If all zones are snoozed, set snooze_all flag
-    if (!all_snooze && !all_active) {
-        bool all_snoozed = true;
-        for (int i = 0; i < TOTAL_ZONE; i++) {
-            if (zone_snooze[i] == 0) {
-                all_snoozed = false;
-                break;
-            }
-        }
-        snooze_all = all_snoozed;
-    }
-    
-    cJSON_Delete(root);
-    
-    if (changed) {
-        // Save to NVS
-        memcpy(g_config.zone_snooze, zone_snooze, sizeof(zone_snooze));
-        if (save_config_to_nvs() == ESP_OK) {
-            ESP_LOGI(TAG, "Snooze configuration saved to NVS");
-            
-            // Publish current snooze state
-            char response_topic[64];
-            char response_json[512];
-            snprintf(response_topic, sizeof(response_topic), "/ZIGRON/%s/SNOOZE_RESPONSE", mac_string);
-            
-            // Build JSON response
-            snprintf(response_json, sizeof(response_json), 
-                    "{\"snooze_all\":%s,\"zones\":[",
-                    snooze_all ? "true" : "false");
-            
-            char zones_str[256] = "";
-            for (int i = 0; i < TOTAL_ZONE; i++) {
-                char zone_str[32];
-                snprintf(zone_str, sizeof(zone_str), 
-                        "{\"zone\":%d,\"snooze\":%s}%s",
-                        i, zone_snooze[i] ? "true" : "false",
-                        (i < TOTAL_ZONE - 1) ? "," : "");
-                strcat(zones_str, zone_str);
-            }
-            strcat(response_json, zones_str);
-            strcat(response_json, "]}");
-            
-            if (mqtt_client && mqtt_started) {
-                esp_mqtt_client_publish(mqtt_client, response_topic, response_json, 0, 0, 0);
-                ESP_LOGI(TAG, "Published snooze config to %s", response_topic);
-            }
-        } else {
-            ESP_LOGE(TAG, "Failed to save snooze config to NVS");
-        }
-    }
-}
-
 
 // ============= APP MAIN =============
 void app_main(void)
